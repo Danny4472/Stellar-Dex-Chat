@@ -11,7 +11,6 @@
     "format": "prettier --write \"src\" \"tests/e2e\" \"*.{ts,mjs,json}\"",
     "check": "prettier --check \"src\" \"tests/e2e\" \"*.{ts,mjs,json}\"",
     "test:unit": "vitest run",
-    "typecheck": "tsc --noEmit && tsc -p tsconfig.test.json --noEmit",
     "typecheck": "pnpm typecheck:src && pnpm typecheck:tests",
     "typecheck:src": "tsc --noEmit",
     "typecheck:tests": "tsc --noEmit -p tsconfig.test.json",
@@ -22,7 +21,9 @@
     "test:a11y": "playwright test --project=a11y",
     "test:unit:watch": "vitest",
     "test:coverage": "vitest run --coverage --maxWorkers=1 --pool=forks --no-file-parallelism",
-    "test:coverage:merge": "vitest run --mergeReports --coverage --reporter=default"
+    "test:coverage:merge": "vitest run --mergeReports --coverage --reporter=default",
+    "contract:bindings:generate": "node scripts/contract-bindings.mjs generate",
+    "contract:bindings:check": "node scripts/contract-bindings.mjs check"
   },
   "dependencies": {
     "@google/generative-ai": "^0.21.0",

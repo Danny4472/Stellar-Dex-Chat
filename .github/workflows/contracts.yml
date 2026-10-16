@@ -5,11 +5,14 @@ on:
     branches: [main]
     paths:
       - "Dechat/stellar-contracts/**"
+      - "Dechat/dex_with_fiat_frontend/src/lib/contracts/**"
       - ".github/workflows/contracts.yml"
   push:
     branches: [main]
     paths:
       - "Dechat/stellar-contracts/**"
+      - "Dechat/dex_with_fiat_frontend/src/lib/contracts/**"
+      - ".github/workflows/contracts.yml"
 
 permissions:
   contents: read
@@ -22,6 +25,12 @@ env:
   # as false). The contract has since grown to ~94 KB. Hoisted to
   # workflow level so the size-report job below stays in sync with it.
   MAX_WASM_BYTES: "98500"
+  # Pinned toolchain used to build the contract spec. Must match the
+  # version used to generate the committed TypeScript bindings so the
+  # ABI comparison below is deterministic.
+  STELLAR_CLI_VERSION: "28.0.0"
+  # Committed TypeScript bindings generated from the Soroban interface.
+  BINDINGS_DIR: "Dechat/dex_with_fiat_frontend/src/lib/contracts"
 
 jobs:
   fmt:
@@ -136,7 +145,7 @@ jobs:
           targets: wasm32v1-none
 
       - name: Install Stellar CLI
-        run: cargo install --locked stellar-cli --version 28.0.0
+        run: cargo install --locked stellar-cli --version "$STELLAR_CLI_VERSION"
 
       - name: Cache Cargo dependencies
         uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
@@ -166,6 +175,92 @@ jobs:
             echo "Error: WASM size $SIZE bytes exceeds ${MAX_WASM_BYTES} byte limit"
             exit 1
           fi
+
+  bindings-drift:
+    name: Contract Bindings Drift
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: Dechat/stellar-contracts
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # stable
+        with:
+          toolchain: stable
+          targets: wasm32v1-none
+
+      - name: Install Stellar CLI
+        run: cargo install --locked stellar-cli --version "$STELLAR_CLI_VERSION"
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+        with:
+          workspaces: Dechat/stellar-contracts -> target
+
+      - name: Build contract spec from pinned toolchain
+        run: stellar contract build
+
+      - name: Generate bindings from current spec
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/generated-bindings
+          mkdir -p /tmp/generated-bindings
+          stellar contract bindings typescript \
+            --wasm target/wasm32v1-none/release/stellar_contracts.optimized.wasm \
+            --output-dir /tmp/generated-bindings \
+            --overwrite
+
+      - name: Compare generated bindings with committed bindings
+        run: |
+          set -euo pipefail
+          COMMITTED="$GITHUB_WORKSPACE/$BINDINGS_DIR"
+
+          if [ ! -d "$COMMITTED" ]; then
+            echo "Error: committed bindings directory $BINDINGS_DIR not found."
+            echo "Generate bindings with: stellar contract bindings typescript --wasm <wasm> --output-dir $BINDINGS_DIR --overwrite"
+            exit 1
+          fi
+
+          # Normalize away volatile metadata (generated timestamps, absolute
+          # paths) so only real ABI drift is reported.
+          normalize() {
+            find "$1" -type f -name '*.ts' -print0 \
+              | sort -z \
+              | xargs -0 -I{} sh -c 'echo "=== {} ==="; sed -E "s/[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z//g; s#$1##g" "{}"'
+          }
+
+          normalize /tmp/generated-bindings > /tmp/generated.norm
+          normalize "$COMMITTED" > /tmp/committed.norm
+
+          if ! diff -u /tmp/committed.norm /tmp/generated.norm > /tmp/bindings.diff; then
+            echo "Error: committed TypeScript bindings are stale or the ABI changed."
+            echo "The contract interface (functions, arguments, return types, or error codes)"
+            echo "no longer matches $BINDINGS_DIR."
+            echo ""
+            echo "Regenerate the bindings and commit the result:"
+            echo "  stellar contract bindings typescript \\"
+            echo "    --wasm Dechat/stellar-contracts/target/wasm32v1-none/release/stellar_contracts.optimized.wasm \\"
+            echo "    --output-dir $BINDINGS_DIR --overwrite"
+            echo ""
+            echo "--- ABI diff (committed vs generated) ---"
+            cat /tmp/bindings.diff
+            exit 1
+          fi
+
+          echo "Committed bindings match the generated contract spec."
+
+      - name: Upload ABI diff artifact
+        if: failure()
+        uses: actions/upload-artifact@a8a3f3ad30e3422c9c7b888a15615d19a852ae32 # v3
+        with:
+          name: contract-abi-diff
+          path: /tmp/bindings.diff
+          if-no-files-found: ignore
 
   deny:
     name: License & Advisory Check
@@ -206,7 +301,7 @@ jobs:
           targets: wasm32v1-none
 
       - name: Install Stellar CLI
-        run: cargo install --locked stellar-cli --version 28.0.0
+        run: cargo install --locked stellar-cli --version "$STELLAR_CLI_VERSION"
 
       - name: Cache Cargo dependencies
         uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
@@ -245,20 +340,12 @@ jobs:
             "base_sha": "${{ github.event.pull_request.base.sha }}",
             "head_sha": "${{ github.event.pull_request.head.sha }}",
             "base_size": ${{ steps.base_size.outputs.size }},
-            "head_size": ${{ steps.head_size.outputs.size }},
-            "limit": ${{ env.MAX_WASM_BYTES }}
+            "head_size": ${{ steps.head_size.outputs.size }}
           }
           EOF
 
-      # PRs from forks get a read-only GITHUB_TOKEN under the `pull_request`
-      # event, so this job can't post a comment directly. The report is
-      # handed off as an artifact to wasm-size-comment.yml, which runs via
-      # `workflow_run` in the base repo's context (write-capable token) and
-      # only ever reads this JSON — it never checks out or executes PR code,
-      # so it stays safe from a malicious PR's build script.
-      - name: Upload size report artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - name: Upload size report
+        uses: actions/upload-artifact@a8a3f3ad30e3422c9c7b888a15615d19a852ae32 # v3
         with:
           name: wasm-size-report
           path: wasm-size-report.json
-          retention-days: 7
