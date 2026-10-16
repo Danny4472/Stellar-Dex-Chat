@@ -19,6 +19,7 @@
     "test:e2e:ui": "playwright test --ui",
     "test:e2e:debug": "playwright test --debug",
     "test:e2e:install": "playwright install",
+    "test:a11y": "playwright test --project=a11y",
     "test:unit:watch": "vitest",
     "test:coverage": "vitest run --coverage --maxWorkers=1 --pool=forks --no-file-parallelism",
     "test:coverage:merge": "vitest run --mergeReports --coverage --reporter=default"
@@ -49,6 +50,7 @@
     "zod": "^4.3.6"
   },
   "devDependencies": {
+    "@axe-core/playwright": "^4.10.2",
     "@eslint/eslintrc": "^3.3.5",
     "@playwright/test": "^1.58.2",
     "@tailwindcss/postcss": "^4",
