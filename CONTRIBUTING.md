@@ -1,62 +1,83 @@
 # Contributing
 
-## Branch Naming
+Thanks for your interest in contributing. This document covers the basics for
+working in this repository, including how we handle integration credentials.
 
-Branches follow this pattern:
-<your-username>/<type>/<short-description>
+## Getting started
 
-`<type>` is one of:
+1. Fork the repository and create a topic branch off `main`.
+2. Make your change with focused commits and a clear message.
+3. Open a pull request describing the problem and the fix.
 
-- `feat/` — new feature
-- `fix/` — bug fix
-- `chore/` — maintenance, tooling, dependencies
-- `docs/` — documentation only
-- `refactor/` — code change that isn't a fix or a feature
-- `test/` — adding or fixing tests
+## Local setup
 
-If your branch addresses one or more issues, include the issue number(s) in the description:
-feat/issues-986-987-988-frontend-accessibility
+Copy the example environment file and fill in your own local values:
 
-fix/issue-966-fee-calculation-overflow
+```sh
+cp .env.example .env
+```
 
-## Commit Message Format
+Never commit a populated `.env` file. Example files must contain placeholders
+only (for example `API_TOKEN=your-token-here`), never real credentials.
 
-Commits follow [Conventional Commits](https://www.conventionalcommits.org/):
-<type>(<scope>): <description>
+## Secret inventory
 
-`<type>` must be one of:
+Every integration credential used by this project is tracked below. This
+inventory records metadata only — **never store secret values here**. Values
+live in the platform secret store (repository/environment secrets or the
+operator's secret manager).
 
-- `feat` — new feature
-- `fix` — bug fix
-- `docs` — documentation only
-- `style` — formatting, no code meaning change
-- `refactor` — code change that isn't a fix or a feature
-- `perf` — performance improvement
-- `test` — adding or fixing tests
-- `build` — build system or dependencies
-- `ci` — CI configuration
-- `chore` — anything else maintenance-related
-- `security` — security fix
+| Secret name | Purpose | Environment | Owner | Rotation cadence | Revocation path |
+| --- | --- | --- | --- | --- | --- |
+| `API_TOKEN` | Authenticates outbound calls to the integration API | production | platform team | every 90 days | Revoke token in the provider console, then issue a replacement and update the secret store |
+| `API_TOKEN` | Same integration, non-production testing | staging | platform team | every 90 days | Revoke token in the provider console, then issue a replacement and update the secret store |
+| `WEBHOOK_SECRET` | Verifies inbound webhook signatures | production | platform team | every 180 days | Rotate the signing secret in the provider console and redeploy consumers |
+| `DEPLOY_KEY` | Deploys release artifacts | production | release owner | every 180 days | Remove the key from the deploy target and generate a new key pair |
 
-`<scope>` is optional and usually the area touched, e.g. `frontend`, `contract`.
+When you add a new integration, add a row here in the same pull request. Keep
+the owner and rotation cadence current; an unowned secret is a finding.
 
-Reference issue numbers in the description when relevant:
-feat(frontend): add CSV export button to AuditTable
+## Secret scanning and push protection
 
-fix(contract): integer overflow in fee calculation for large deposits #966
+Enable the platform's secret scanning and push protection so credentials are
+caught before they land:
 
-docs: add CONTRIBUTING.md with branch and commit conventions
+1. Open **Settings → Code security and analysis** for the repository.
+2. Enable **Secret scanning**.
+3. Enable **Push protection** so commits containing detected secrets are
+   blocked at push time.
+4. Enable **Secret scanning alerts** notifications for the security team.
 
-A breaking change is marked with `!` after the type/scope:
-feat(contract)!: change withdrawal function signature
+Where the platform does not support these features, run the repository's
+security audit workflow on every pull request as the fallback.
 
-## Pull Request Checklist
+## Leak response
 
-Before opening a PR:
+If a credential is exposed (committed, logged, or otherwise disclosed):
 
-- [ ] Branch name follows the format above
-- [ ] Commit messages follow the format above
-- [ ] PR description links the issue(s) it closes (`Closes #123`)
-- [ ] `npx lint-staged` runs clean (this also runs automatically on commit)
-- [ ] Tests pass locally
-- [ ] No unrelated files included in the diff
+1. **Contain** — treat the value as compromised. Do not try to scrub history
+   first; assume it is already public. Remove the value from the working tree
+   and stop any process using it.
+2. **Rotate** — revoke the exposed credential using the revocation path in the
+   inventory above, then issue a replacement and update the secret store. Rotate
+   every credential that shared the exposure.
+3. **Verify** — confirm the old credential no longer authenticates, confirm the
+   new credential works in each affected environment, and check logs and alerts
+   for unauthorized use during the exposure window.
+4. **Record** — note the incident, the impacted integrations, and the rotation
+   in the security log so the inventory stays accurate.
+
+Run a tabletop exercise of this procedure periodically, and verify that every
+integration in the inventory has a working revocation path.
+
+## Logging
+
+Never log secret values. Log placeholders or identifiers instead (for example
+`token=***` or a key name), so logs remain useful without leaking credentials.
+
+## Pull request checklist
+
+- [ ] No real secrets, tokens, or credentials are included.
+- [ ] Example files and logs use placeholders.
+- [ ] New integrations are added to the secret inventory.
+- [ ] Tests and checks pass.

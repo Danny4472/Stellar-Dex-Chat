@@ -132,10 +132,135 @@ jobs:
           }
           NODE
 
+  secret-inventory:
+    name: Secret Inventory & Leak Guard
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      # Secret inventory: purpose, environment, owner, rotation cadence, and
+      # revocation path for each integration credential. Values are NEVER
+      # stored here — only metadata. See SECURITY.md for the leak-response
+      # procedure (containment, rotation, verification).
+      - name: Validate secret inventory metadata
+        run: |
+          node - <<'NODE'
+          const fs = require('fs');
+          const path = require('path');
+
+          const INVENTORY_FILE = path.join(process.env.GITHUB_WORKSPACE, '.github/secret-inventory.json');
+          const REQUIRED = ['name', 'purpose', 'environment', 'owner', 'rotationCadence', 'revocationPath'];
+          const FORBIDDEN_VALUE_KEYS = ['value', 'secret', 'token', 'password', 'key', 'credential'];
+
+          if (!fs.existsSync(INVENTORY_FILE)) {
+            console.error('Missing .github/secret-inventory.json');
+            process.exit(1);
+          }
+
+          let inventory;
+          try {
+            inventory = JSON.parse(fs.readFileSync(INVENTORY_FILE, 'utf8'));
+          } catch (err) {
+            console.error(`Invalid JSON in secret inventory: ${err.message}`);
+            process.exit(1);
+          }
+
+          const entries = Array.isArray(inventory) ? inventory : inventory.secrets || [];
+          if (entries.length === 0) {
+            console.error('Secret inventory is empty; every integration credential must be tracked.');
+            process.exit(1);
+          }
+
+          let failures = 0;
+          for (const entry of entries) {
+            const label = entry.name || '<unnamed>';
+            for (const field of REQUIRED) {
+              if (!entry[field] || String(entry[field]).trim() === '') {
+                console.error(`[${label}] missing required field: ${field}`);
+                failures += 1;
+              }
+            }
+            for (const key of Object.keys(entry)) {
+              if (FORBIDDEN_VALUE_KEYS.includes(key.toLowerCase())) {
+                console.error(`[${label}] inventory must not store secret values (found key: ${key})`);
+                failures += 1;
+              }
+            }
+          }
+
+          if (failures > 0) {
+            console.error(`${failures} inventory problem(s) found.`);
+            process.exit(1);
+          }
+          console.log(`Secret inventory OK: ${entries.length} credential(s) tracked (metadata only).`);
+          NODE
+
+      # Placeholder guard: example env files and logs must use placeholders,
+      # never real values. Fails if a committed example env file contains a
+      # value that looks like a live credential.
+      - name: Guard example env files against real values
+        run: |
+          node - <<'NODE'
+          const fs = require('fs');
+          const path = require('path');
+
+          const ROOT = process.env.GITHUB_WORKSPACE;
+          const EXAMPLE_PATTERNS = [/\.env\.example$/, /\.env\.sample$/, /\.env\.template$/];
+          const PLACEHOLDER_HINTS = ['your-', 'changeme', 'placeholder', 'example', 'xxxx', '<', 'redacted', 'dummy', 'test-'];
+          const SUSPICIOUS = [
+            /(?:sk|pk)_(?:live|test)_[A-Za-z0-9]{16,}/, // Stripe-style
+            /AKIA[0-9A-Z]{16}/, // AWS access key id
+            /gh[pousr]_[A-Za-z0-9]{36,}/, // GitHub tokens
+            /-----BEGIN [A-Z ]*PRIVATE KEY-----/, // private keys
+          ];
+
+          const walk = (dir) => {
+            const out = [];
+            for (const name of fs.readdirSync(dir)) {
+              if (name === 'node_modules' || name === '.git') continue;
+              const full = path.join(dir, name);
+              const stat = fs.statSync(full);
+              if (stat.isDirectory()) out.push(...walk(full));
+              else out.push(full);
+            }
+            return out;
+          };
+
+          const files = walk(ROOT).filter((f) => EXAMPLE_PATTERNS.some((re) => re.test(f)));
+          let failures = 0;
+
+          for (const file of files) {
+            const rel = path.relative(ROOT, file);
+            const lines = fs.readFileSync(file, 'utf8').split('\n');
+            lines.forEach((line, i) => {
+              const trimmed = line.trim();
+              if (!trimmed || trimmed.startsWith('#')) return;
+              const eq = trimmed.indexOf('=');
+              if (eq === -1) return;
+              const value = trimmed.slice(eq + 1).trim();
+              if (!value) return;
+              const looksPlaceholder = PLACEHOLDER_HINTS.some((h) => value.toLowerCase().includes(h));
+              const looksReal = SUSPICIOUS.some((re) => re.test(value));
+              if (looksReal && !looksPlaceholder) {
+                console.error(`${rel}:${i + 1} appears to contain a real value; use a placeholder.`);
+                failures += 1;
+              }
+            });
+          }
+
+          if (failures > 0) {
+            console.error(`${failures} example env value(s) look like real credentials.`);
+            process.exit(1);
+          }
+          console.log(`Placeholder guard OK: checked ${files.length} example env file(s).`);
+          NODE
+
   open-tracking-issue:
     name: Open Tracking Issue
     runs-on: ubuntu-latest
-    needs: [contracts-audit, frontend-audit]
+    needs: [contracts-audit, frontend-audit, secret-inventory]
     if: failure()
 
     steps:
