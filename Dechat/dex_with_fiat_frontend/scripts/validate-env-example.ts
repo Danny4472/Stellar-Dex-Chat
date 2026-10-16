@@ -62,6 +62,141 @@ function extractEnvExampleVariables(): Set<string> {
 }
 
 /**
+ * Observability alerting thresholds for issue #121.
+ *
+ * These thresholds drive warning/critical alerts for aging withdrawals and
+ * payout reconciliation backlog. They are validated here so that operators
+ * cannot silently ship a misconfigured alerting surface (e.g. critical below
+ * warning, or a zero/negative age that would flap on every tick).
+ *
+ * Each threshold is paired with a concrete operator action and a safe record
+ * reference (an id/type, never PII or secrets) so alerts are actionable.
+ */
+interface AlertThreshold {
+  /** Stable key used for deduplication of flapping alerts. */
+  key: string;
+  /** Warning threshold value (inclusive). */
+  warning: number;
+  /** Critical threshold value (inclusive); must be >= warning. */
+  critical: number;
+  /** Unit of the threshold, for operator context. */
+  unit: 'seconds' | 'count';
+  /** Concrete operator action to take when the alert fires. */
+  operatorAction: string;
+  /** Safe, non-sensitive record reference template. */
+  recordRef: string;
+  /**
+   * Whether the condition is an expected user approval delay rather than a
+   * genuine provider failure. Expected delays are classified separately so
+   * they do not page on-call for normal user behavior.
+   */
+  expectedUserDelay: boolean;
+}
+
+const ALERT_THRESHOLDS: AlertThreshold[] = [
+  {
+    key: 'withdrawal.queue.age',
+    warning: 15 * 60,
+    critical: 60 * 60,
+    unit: 'seconds',
+    operatorAction: 'Inspect withdrawal queue and retry stuck payouts.',
+    recordRef: 'withdrawal:{withdrawalId}',
+    expectedUserDelay: false,
+  },
+  {
+    key: 'withdrawal.queue.depth',
+    warning: 50,
+    critical: 200,
+    unit: 'count',
+    operatorAction: 'Scale payout workers or drain the withdrawal queue.',
+    recordRef: 'withdrawal:{withdrawalId}',
+    expectedUserDelay: false,
+  },
+  {
+    key: 'indexer.lag',
+    warning: 60,
+    critical: 300,
+    unit: 'seconds',
+    operatorAction: 'Check indexer health and re-sync from last safe block.',
+    recordRef: 'indexer:{chainId}:{blockNumber}',
+    expectedUserDelay: false,
+  },
+  {
+    key: 'webhook.backlog',
+    warning: 100,
+    critical: 1000,
+    unit: 'count',
+    operatorAction: 'Drain webhook backlog and verify provider delivery.',
+    recordRef: 'webhook:{webhookId}',
+    expectedUserDelay: false,
+  },
+  {
+    key: 'reconciliation.age',
+    warning: 30 * 60,
+    critical: 2 * 60 * 60,
+    unit: 'seconds',
+    operatorAction: 'Run payout reconciliation and resolve unmatched records.',
+    recordRef: 'reconciliation:{reconciliationId}',
+    expectedUserDelay: false,
+  },
+  {
+    key: 'withdrawal.awaiting_user_approval',
+    warning: 24 * 60 * 60,
+    critical: 7 * 24 * 60 * 60,
+    unit: 'seconds',
+    operatorAction: 'Notify user; do not page on-call for expected approval delay.',
+    recordRef: 'withdrawal:{withdrawalId}',
+    expectedUserDelay: true,
+  },
+];
+
+/**
+ * Validate alerting thresholds: warning <= critical, positive values, unique
+ * dedup keys, and safe record references (no secrets/PII placeholders).
+ */
+function validateAlertThresholds(): boolean {
+  let isValid = true;
+  const seenKeys = new Set<string>();
+
+  for (const t of ALERT_THRESHOLDS) {
+    if (seenKeys.has(t.key)) {
+      console.error(`❌ ERROR: Duplicate alert dedup key: ${t.key}`);
+      isValid = false;
+    }
+    seenKeys.add(t.key);
+
+    if (t.warning <= 0 || t.critical <= 0) {
+      console.error(`❌ ERROR: Alert ${t.key} has non-positive threshold`);
+      isValid = false;
+    }
+
+    if (t.critical < t.warning) {
+      console.error(
+        `❌ ERROR: Alert ${t.key} critical (${t.critical}) < warning (${t.warning})`,
+      );
+      isValid = false;
+    }
+
+    if (!t.operatorAction || !t.recordRef) {
+      console.error(`❌ ERROR: Alert ${t.key} missing operator action or record ref`);
+      isValid = false;
+    }
+
+    // Safe record references must be templated ids, never raw secrets/PII.
+    if (/secret|token|password|email|address/i.test(t.recordRef)) {
+      console.error(`❌ ERROR: Alert ${t.key} record ref may leak sensitive data`);
+      isValid = false;
+    }
+  }
+
+  if (isValid) {
+    console.log(`✅ SUCCESS: ${ALERT_THRESHOLDS.length} alert thresholds validated`);
+  }
+
+  return isValid;
+}
+
+/**
  * Main validation logic
  */
 function validateEnvExample(): boolean {
@@ -97,5 +232,6 @@ function validateEnvExample(): boolean {
 }
 
 // Run validation
-const isValid = validateEnvExample();
-process.exit(isValid ? 0 : 1);
+const envValid = validateEnvExample();
+const alertsValid = validateAlertThresholds();
+process.exit(envValid && alertsValid ? 0 : 1);
