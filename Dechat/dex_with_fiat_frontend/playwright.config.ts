@@ -26,6 +26,14 @@ export default defineConfig({
       name: 'webkit',
       use: { ...devices['Desktop Safari'] },
     },
+    {
+      // Payout authorization boundary regression matrix (#117).
+      // Runs the route-by-role cases (anonymous, unrelated, owner, admin)
+      // including alternate identifiers, pagination cursors, and exports.
+      name: 'payout-authz',
+      testMatch: /payout.*authz.*\.spec\.ts/,
+      use: { ...devices['Desktop Chrome'] },
+    },
   ],
   webServer: {
     command: process.env.CI ? 'npx next start' : 'npx next dev --turbopack',
