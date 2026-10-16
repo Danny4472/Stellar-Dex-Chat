@@ -60,3 +60,44 @@ Before opening a PR:
 - [ ] `npx lint-staged` runs clean (this also runs automatically on commit)
 - [ ] Tests pass locally
 - [ ] No unrelated files included in the diff
+
+## Backup & Disaster Recovery for Payout State
+
+Changes that touch payout intents, idempotency records, or audit history must keep the
+backup/DR guarantees below intact. See the payout DR runbook for the full procedure.
+
+### Recovery objectives
+
+| Data set | RPO | RTO |
+| --- | --- | --- |
+| Payout intents (in-flight and settled) | 5 minutes | 1 hour |
+| Idempotency records | 0 (synchronous, replicated) | 1 hour |
+| Audit history | 5 minutes | 4 hours |
+
+Idempotency records must never be lost: a restore that drops them risks replaying transfers.
+
+### Backup ownership, retention, and access
+
+- Backups are encrypted at rest and in transit; keys are held by the on-call platform owner
+  and rotated on the standard key-rotation schedule.
+- Retention: 35 days of point-in-time recovery plus monthly full snapshots for 12 months.
+- Restore permissions are limited to the on-call platform owner and a designated backup
+  approver; restores require a second reviewer.
+- Dependencies: managed database snapshots, the key management service, and the audit log
+  archive. A restore is not complete until all three are verified.
+
+### Reconciliation before writes resume
+
+After restoring into isolation, reconcile before re-enabling writes:
+
+1. Compare restored payout intents against authoritative provider records and on-chain state.
+2. Verify audit history is continuous with no gaps across the restore boundary.
+3. Confirm idempotency records are present so no transfer can be replayed.
+4. Reconcile in-flight transfers and resolve any mismatch before writes resume.
+
+### Drills and remediation
+
+- Run a restore drill quarterly, and after any change to the backup pipeline.
+- Each drill restores into isolation and verifies counts, audit continuity, idempotency, and
+  in-flight transfer reconciliation.
+- File remediation items as issues, assign an owner, and track them to closure before the next drill.
