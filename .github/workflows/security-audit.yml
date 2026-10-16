@@ -4,10 +4,11 @@ name: Security Audit
 # when a contract or frontend PR happens to touch the affected manifest —
 # contracts.yml's `deny` job and the frontend build only run on paths that
 # touch their respective directories, so a fresh RUSTSEC/npm advisory
-# otherwise goes unnoticed until someone edits nearby code. This runs both
-# audits weekly regardless of what changed.
+# otherwise goes unnoticed until someone edits nearby code. This runs on every
+# pull request and weekly regardless of what changed.
 
 on:
+  pull_request:
   schedule:
     - cron: "0 6 * * 1" # Every Monday 06:00 UTC
   workflow_dispatch:
@@ -58,8 +59,78 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      # Severity policy: fail on high/critical. Findings below the threshold are
+      # reported but do not block. Time-bounded exceptions live in
+      # .github/security-audit-exceptions.json (owner + expiry required).
       - name: Audit production dependencies
-        run: pnpm audit --prod --audit-level high
+        run: pnpm audit --prod --audit-level high --json > pnpm-audit.json || true
+
+      - name: Enforce severity policy and report dependency paths
+        run: |
+          node - <<'NODE'
+          const fs = require('fs');
+          const path = require('path');
+
+          const THRESHOLD = 'high';
+          const RANK = { info: 0, low: 1, moderate: 2, high: 3, critical: 4 };
+          const EXCEPTIONS_FILE = path.join(process.env.GITHUB_WORKSPACE, '.github/security-audit-exceptions.json');
+
+          let exceptions = [];
+          if (fs.existsSync(EXCEPTIONS_FILE)) {
+            exceptions = JSON.parse(fs.readFileSync(EXCEPTIONS_FILE, 'utf8'));
+          }
+
+          const now = Date.now();
+          const activeExceptions = exceptions.filter((e) => {
+            if (!e.owner || !e.expiry) {
+              console.error(`Exception for ${e.id} is missing owner or expiry; ignoring.`);
+              return false;
+            }
+            if (Date.parse(e.expiry) < now) {
+              console.error(`Exception for ${e.id} expired on ${e.expiry}; ignoring.`);
+              return false;
+            }
+            return true;
+          });
+
+          const raw = fs.existsSync('pnpm-audit.json') ? fs.readFileSync('pnpm-audit.json', 'utf8') : '{}';
+          let report = {};
+          try { report = JSON.parse(raw); } catch { report = {}; }
+
+          const advisories = report.advisories || {};
+          const findings = [];
+
+          for (const advisory of Object.values(advisories)) {
+            const severity = advisory.severity || 'low';
+            if ((RANK[severity] ?? 0) < RANK[THRESHOLD]) continue;
+
+            const moduleName = advisory.module_name;
+            const patched = advisory.patched_versions || 'no patched version published';
+            const paths = (advisory.findings || []).flatMap((f) => f.paths || []);
+
+            const excepted = activeExceptions.some((e) => e.id === advisory.id || e.id === advisory.github_advisory_id);
+            findings.push({ id: advisory.github_advisory_id || advisory.id, moduleName, severity, patched, paths, excepted });
+          }
+
+          if (findings.length === 0) {
+            console.log('No findings at or above the severity threshold.');
+            process.exit(0);
+          }
+
+          let blocking = 0;
+          for (const f of findings) {
+            const status = f.excepted ? 'EXCEPTED' : 'BLOCKING';
+            if (!f.excepted) blocking += 1;
+            console.log(`[${status}] ${f.id} ${f.moduleName} (${f.severity})`);
+            console.log(`  patched version: ${f.patched}`);
+            for (const p of f.paths) console.log(`  dependency path: ${p}`);
+          }
+
+          if (blocking > 0) {
+            console.error(`${blocking} finding(s) at or above '${THRESHOLD}' without a valid exception.`);
+            process.exit(1);
+          }
+          NODE
 
   open-tracking-issue:
     name: Open Tracking Issue
@@ -93,14 +164,15 @@ jobs:
             const issue = await github.rest.issues.create({
               owner, repo, title, labels: [label],
               body: [
-                'The weekly `security-audit.yml` workflow (`cargo deny check advisories`',
-                'and/or `pnpm audit --prod --audit-level high`) failed.',
+                'The `security-audit.yml` workflow (`cargo deny check advisories`',
+                'and/or the pnpm severity policy) failed.',
                 '',
                 `Failed run: ${runUrl}`,
                 '',
                 'Close this issue once the advisory has been triaged (ignored with a',
                 'documented reason in `Dechat/stellar-contracts/deny.toml`, or fixed by',
-                'a dependency bump).',
+                'a dependency bump). Security bumps are not auto-merged; they go through',
+                'the normal review and test gates.',
               ].join('\n'),
             });
             core.notice(`Opened tracking issue #${issue.data.number}`);
