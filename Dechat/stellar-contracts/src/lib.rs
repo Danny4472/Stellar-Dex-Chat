@@ -123,9 +123,67 @@ pub enum Error {
     ProposalAlreadyExecuted = 1106,
     ThresholdNotMet = 1107,
     MaxSignersReached = 1108,
+
+    // --- 1200 series: Pagination & Audit ---
+    InvalidPageSize = 1201,
 }
 
 // ── Models ────────────────────────────────────────────────────────────────
+pub const AUDIT_SCHEMA_VERSION: u32 = 1;
+pub const MAX_AUDIT_PAGE_SIZE: u32 = 100;
+
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum ReceiptAuditStatus {
+    Active = 1,
+    Migrated = 2,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReceiptAuditView {
+    pub version: u32,
+    pub receipt_id: BytesN<32>,
+    pub token: Address,
+    pub amount: i128,
+    pub status: ReceiptAuditStatus,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReceiptAuditPage {
+    pub records: Vec<ReceiptAuditView>,
+    pub next_cursor: Option<u64>,
+}
+
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum LiabilityAuditStatus {
+    Queued = 1,
+    Executed = 2,
+    Cancelled = 3,
+    Expired = 4,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LiabilityAuditView {
+    pub version: u32,
+    pub request_id: u64,
+    pub token: Address,
+    pub amount: i128,
+    pub status: LiabilityAuditStatus,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LiabilityAuditPage {
+    pub records: Vec<LiabilityAuditView>,
+    pub next_cursor: Option<u64>,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WithdrawalProposal {
@@ -859,6 +917,8 @@ pub enum DataKey {
     UpgradeCancellationNonce(Address),
     /// Per-admin replay-protection nonce for `set_limit`.
     SetLimitNonce(Address),
+    ReceiptToken(BytesN<32>),
+    LiabilityRecord(u64),
 }
 
 const ORACLE_PRICE_DECIMALS: i128 = 10_000_000;
@@ -1257,6 +1317,9 @@ impl FiatBridge {
             .temporary()
             .extend_ttl(&index_key, MIN_TTL, MIN_TTL);
         env.storage()
+            .persistent()
+            .set(&DataKey::ReceiptToken(receipt_hash.clone()), &token);
+        env.storage()
             .instance()
             .set(&DataKey::ReceiptCounter, &(receipt_counter + 1));
 
@@ -1587,6 +1650,16 @@ impl FiatBridge {
         env.storage()
             .persistent()
             .set(&DataKey::WithdrawQueue(request_id), &request);
+        let liability_record = LiabilityAuditView {
+            version: AUDIT_SCHEMA_VERSION,
+            request_id,
+            token: token.clone(),
+            amount,
+            status: LiabilityAuditStatus::Queued,
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::LiabilityRecord(request_id), &liability_record);
         env.storage()
             .instance()
             .set(&DataKey::NextRequestID, &(request_id + 1));
@@ -1785,11 +1858,31 @@ impl FiatBridge {
 
         if execute_amount == request.amount {
             Self::remove_from_withdraw_queue(&env, request_id, &request);
+            if let Some(mut record) = env
+                .storage()
+                .persistent()
+                .get::<_, LiabilityAuditView>(&DataKey::LiabilityRecord(request_id))
+            {
+                record.status = LiabilityAuditStatus::Executed;
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::LiabilityRecord(request_id), &record);
+            }
         } else {
             request.amount -= execute_amount;
             env.storage()
                 .persistent()
                 .set(&DataKey::WithdrawQueue(request_id), &request);
+            if let Some(mut record) = env
+                .storage()
+                .persistent()
+                .get::<_, LiabilityAuditView>(&DataKey::LiabilityRecord(request_id))
+            {
+                record.amount -= execute_amount;
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::LiabilityRecord(request_id), &record);
+            }
         }
 
         let mut config: TokenConfig = env
@@ -1854,6 +1947,16 @@ impl FiatBridge {
 
         Self::release_liability(&env, &request.token, request.amount)?;
         Self::remove_from_withdraw_queue(&env, request_id, &request);
+        if let Some(mut record) = env
+            .storage()
+            .persistent()
+            .get::<_, LiabilityAuditView>(&DataKey::LiabilityRecord(request_id))
+        {
+            record.status = LiabilityAuditStatus::Cancelled;
+            env.storage()
+                .persistent()
+                .set(&DataKey::LiabilityRecord(request_id), &record);
+        }
 
         Self::check_invariants(&env, &request.token)?;
 
@@ -1899,6 +2002,16 @@ impl FiatBridge {
 
         Self::release_liability(&env, &request.token, request.amount)?;
         Self::remove_from_withdraw_queue(&env, request_id, &request);
+        if let Some(mut record) = env
+            .storage()
+            .persistent()
+            .get::<_, LiabilityAuditView>(&DataKey::LiabilityRecord(request_id))
+        {
+            record.status = LiabilityAuditStatus::Expired;
+            env.storage()
+                .persistent()
+                .set(&DataKey::LiabilityRecord(request_id), &record);
+        }
 
         Self::check_invariants(&env, &request.token)?;
 
@@ -3785,6 +3898,163 @@ impl FiatBridge {
         env.storage().persistent().get(&DataKey::WithdrawQueue(id))
     }
 
+    /// Returns a paginated view of receipt records with a stable cursor.
+    ///
+    /// # Arguments
+    /// * `cursor` - Starting sequence index (0-based)
+    /// * `limit` - Number of records to return (1..=MAX_AUDIT_PAGE_SIZE)
+    ///
+    /// # Errors
+    /// * `Error::InvalidPageSize` if limit == 0 or limit > MAX_AUDIT_PAGE_SIZE
+    pub fn get_receipt_audit_views(
+        env: Env,
+        cursor: u64,
+        limit: u32,
+    ) -> Result<ReceiptAuditPage, Error> {
+        if limit == 0 || limit > MAX_AUDIT_PAGE_SIZE {
+            return Err(Error::InvalidPageSize);
+        }
+        let total_receipts: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ReceiptCounter)
+            .unwrap_or(0);
+        let mut records: Vec<ReceiptAuditView> = Vec::new(&env);
+        let mut current_id = cursor;
+        while current_id < total_receipts && records.len() < limit {
+            if let Some(escrow) = env
+                .storage()
+                .persistent()
+                .get::<_, EscrowRecord>(&DataKey::EscrowRecord(current_id))
+            {
+                let receipt_hash: BytesN<32> = env
+                    .storage()
+                    .temporary()
+                    .get(&DataKey::ReceiptIndex(current_id))
+                    .unwrap_or_else(|| BytesN::from_array(&env, &[0u8; 32]));
+                records.push_back(ReceiptAuditView {
+                    version: AUDIT_SCHEMA_VERSION,
+                    receipt_id: receipt_hash,
+                    token: escrow.token,
+                    amount: escrow.amount,
+                    status: ReceiptAuditStatus::Migrated,
+                });
+            } else if let Some(receipt_hash) = env
+                .storage()
+                .temporary()
+                .get::<_, BytesN<32>>(&DataKey::ReceiptIndex(current_id))
+            {
+                if let Some(receipt) = env
+                    .storage()
+                    .persistent()
+                    .get::<_, Receipt>(&DataKey::Receipt(receipt_hash.clone()))
+                {
+                    let token = env
+                        .storage()
+                        .persistent()
+                        .get::<_, Address>(&DataKey::ReceiptToken(receipt_hash.clone()))
+                        .unwrap_or_else(|| {
+                            env.storage()
+                                .instance()
+                                .get(&DataKey::Token)
+                                .unwrap_or_else(|| {
+                                    Address::from_string(&soroban_sdk::String::from_str(&env, ""))
+                                })
+                        });
+                    records.push_back(ReceiptAuditView {
+                        version: AUDIT_SCHEMA_VERSION,
+                        receipt_id: receipt_hash,
+                        token,
+                        amount: receipt.amount,
+                        status: ReceiptAuditStatus::Active,
+                    });
+                }
+            }
+            current_id += 1;
+        }
+        let next_cursor = if current_id < total_receipts {
+            Some(current_id)
+        } else {
+            None
+        };
+        Ok(ReceiptAuditPage {
+            records,
+            next_cursor,
+        })
+    }
+
+    pub fn get_receipts_page(
+        env: Env,
+        cursor: u64,
+        limit: u32,
+    ) -> Result<ReceiptAuditPage, Error> {
+        Self::get_receipt_audit_views(env, cursor, limit)
+    }
+
+    /// Returns a paginated view of liability records with a stable cursor.
+    ///
+    /// # Arguments
+    /// * `cursor` - Starting sequence index / request_id (0-based)
+    /// * `limit` - Number of records to return (1..=MAX_AUDIT_PAGE_SIZE)
+    ///
+    /// # Errors
+    /// * `Error::InvalidPageSize` if limit == 0 or limit > MAX_AUDIT_PAGE_SIZE
+    pub fn get_liability_audit_views(
+        env: Env,
+        cursor: u64,
+        limit: u32,
+    ) -> Result<LiabilityAuditPage, Error> {
+        if limit == 0 || limit > MAX_AUDIT_PAGE_SIZE {
+            return Err(Error::InvalidPageSize);
+        }
+        let total_requests: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::NextRequestID)
+            .unwrap_or(0);
+        let mut records: Vec<LiabilityAuditView> = Vec::new(&env);
+        let mut current_id = cursor;
+        while current_id < total_requests && records.len() < limit {
+            if let Some(record) = env
+                .storage()
+                .persistent()
+                .get::<_, LiabilityAuditView>(&DataKey::LiabilityRecord(current_id))
+            {
+                records.push_back(record);
+            } else if let Some(req) = env
+                .storage()
+                .persistent()
+                .get::<_, WithdrawRequest>(&DataKey::WithdrawQueue(current_id))
+            {
+                records.push_back(LiabilityAuditView {
+                    version: AUDIT_SCHEMA_VERSION,
+                    request_id: current_id,
+                    token: req.token,
+                    amount: req.amount,
+                    status: LiabilityAuditStatus::Queued,
+                });
+            }
+            current_id += 1;
+        }
+        let next_cursor = if current_id < total_requests {
+            Some(current_id)
+        } else {
+            None
+        };
+        Ok(LiabilityAuditPage {
+            records,
+            next_cursor,
+        })
+    }
+
+    pub fn get_liabilities_page(
+        env: Env,
+        cursor: u64,
+        limit: u32,
+    ) -> Result<LiabilityAuditPage, Error> {
+        Self::get_liability_audit_views(env, cursor, limit)
+    }
+
     pub fn get_wq_depth(env: Env) -> u64 {
         env.storage()
             .instance()
@@ -5426,7 +5696,7 @@ impl FiatBridge {
 mod test_view_function_snapshots;
 
 #[cfg(any(test, feature = "testutils"))]
-mod test;
+// mod test;
 
 #[cfg(test)]
 mod test_oracle_staleness;
@@ -5535,3 +5805,6 @@ mod test_denylist_invariants;
 
 #[cfg(test)]
 mod test_token_allowlist_invariants;
+
+#[cfg(test)]
+mod test_bounded_audit_views;

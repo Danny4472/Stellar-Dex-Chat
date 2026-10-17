@@ -4,6 +4,12 @@ import { getPayoutProvider } from '@/lib/payout/providers/registry';
 import { applyRateLimit, getClientIp } from '@/lib/rateLimit';
 import { transferStatusSchema } from '@/lib/apiSchemas';
 
+import {
+  transitionPayoutStatus,
+  InvalidPayoutTransitionError,
+  type PayoutStatus,
+} from '@/lib/transferStore';
+
 const RATE_LIMIT = { maxRequests: 10, windowMs: 60_000 };
 
 export async function POST(request: NextRequest) {
@@ -38,6 +44,24 @@ export async function POST(request: NextRequest) {
 
     const provider = getPayoutProvider();
     const data = await provider.checkTransferStatus({ reference });
+
+    if (data && typeof data.status === 'string') {
+      const normalizedStatus = data.status.toLowerCase() as PayoutStatus;
+      try {
+        transitionPayoutStatus({
+          reference,
+          targetStatus: normalizedStatus,
+          actor: 'polling',
+          providerReference: data.reference ?? reference,
+          reason: 'Status polling update',
+          amount: typeof data.amount === 'number' ? data.amount : undefined,
+        });
+      } catch (err) {
+        if (err instanceof InvalidPayoutTransitionError) {
+          console.warn('Polling transition rejected:', err.message);
+        }
+      }
+    }
 
     return NextResponse.json({
       success: true,

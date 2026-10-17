@@ -3,30 +3,30 @@ import * as Sentry from '@sentry/nextjs';
 import { getPayoutProvider } from '@/lib/payout/providers/registry';
 import { telemetry } from '@/lib/telemetry';
 import { applyRateLimit, getClientIp } from '@/lib/rateLimit';
-import { setTransferStatus } from '@/lib/transferStore';
+import { transitionPayoutStatus } from '@/lib/transferStore';
 import { initiateTransferSchema } from '@/lib/apiSchemas';
+import {
+  executeIdempotentPayout,
+  IdempotencyPayloadMismatchError,
+  ConcurrentRequestInProgressError,
+} from '@/lib/payout/idempotency';
 
 const RATE_LIMIT = { maxRequests: 3, windowMs: 60_000 };
-
-const idempotencyCache = new Map<string, { result: unknown; timestamp: number }>();
-const IDEMPOTENCY_TTL_MS = 24 * 60 * 60 * 1000;
 
 export async function POST(request: NextRequest) {
   const ip = getClientIp(request);
   const limited = applyRateLimit(ip, '/api/initiate-transfer', RATE_LIMIT);
   if (limited) return limited;
 
-  const idempotencyKey = request.headers.get('X-Idempotency-Key');
+  const idempotencyKey =
+    request.headers.get('x-idempotency-key') ||
+    request.headers.get('idempotency-key');
+
   if (!idempotencyKey) {
     return NextResponse.json(
       { success: false, message: 'X-Idempotency-Key header is required' },
       { status: 400 },
     );
-  }
-
-  const cached = idempotencyCache.get(idempotencyKey);
-  if (cached && Date.now() - cached.timestamp < IDEMPOTENCY_TTL_MS) {
-    return NextResponse.json({ success: true, data: cached.result });
   }
 
   const traceContext = telemetry.extractTraceFromHeaders(request.headers);
@@ -79,53 +79,107 @@ export async function POST(request: NextRequest) {
     }
 
     const { source, reason, amount, recipient } = validationResult.data;
-    // `clientSessionId` isn't part of initiateTransferSchema, so it's read
-    // from the raw (already-validated-as-an-object) body instead of
-    // validationResult.data.
     const bodyRecord = body as Record<string, unknown>;
     const clientSessionId =
       typeof bodyRecord.clientSessionId === 'string'
         ? bodyRecord.clientSessionId
         : undefined;
 
+    const userId =
+      request.headers.get('x-user-id') ||
+      request.headers.get('x-wallet-address') ||
+      clientSessionId ||
+      ip ||
+      'default-user';
+
     telemetry.addLog(span.spanId, 'info', 'Request validated', {
       hasSource: !!source,
       hasAmount: !!amount,
       hasRecipient: !!recipient,
-      amount: amount,
+      amount,
     });
 
-    const provider = getPayoutProvider();
-    const data = await provider.initiateTransfer({
-      source,
-      reason,
-      amount,
-      recipient,
+    // Execute through idempotency layer scoped to user and payout intent
+    const { isRetry, data } = await executeIdempotentPayout({
+      idempotencyKey,
+      userId,
+      payload: { source, reason, amount, recipient },
+      execute: async () => {
+        const provider = getPayoutProvider();
+        const responseData = await provider.initiateTransfer({
+          source,
+          reason,
+          amount,
+          recipient,
+          reference: idempotencyKey, // Pass stable idempotency reference to provider
+        });
+
+        const transferReference =
+          typeof responseData.reference === 'string' && responseData.reference
+            ? responseData.reference
+            : idempotencyKey;
+
+        if (transferReference) {
+          transitionPayoutStatus({
+            reference: transferReference,
+            targetStatus: 'pending',
+            actor: 'user',
+            providerReference: transferReference,
+            reason: 'Payout initiation',
+            amount: Number(amount),
+            clientSessionId,
+          });
+        }
+
+        return responseData;
+      },
+    });
+
+    telemetry.addLog(span.spanId, 'info', 'Transfer initiation completed', {
+      isRetry,
       reference: idempotencyKey,
     });
-
-    const transferReference =
-      typeof data.reference === 'string' && data.reference
-        ? data.reference
-        : idempotencyKey;
-
-    if (transferReference) {
-      setTransferStatus({
-        reference: transferReference,
-        status: 'pending',
-        amount: Number(amount),
-        updatedAt: new Date().toISOString(),
-        clientSessionId,
-      });
-    }
-
-    idempotencyCache.set(idempotencyKey, { result: data, timestamp: Date.now() });
+    telemetry.finishSpan(span.spanId, { success: true });
 
     return NextResponse.json({
       success: true,
       data,
     });
   } catch (error: unknown) {
+    if (error instanceof IdempotencyPayloadMismatchError) {
+      telemetry.addLog(span.spanId, 'warn', 'Idempotency key reused with different payload', {
+        idempotencyKey,
+      });
+      telemetry.finishSpan(span.spanId, {
+        success: false,
+        error: error.message,
+      });
+      return NextResponse.json(
+        {
+          success: false,
+          message: 'Idempotency key reuse with different payload',
+        },
+        { status: 422 },
+      );
+    }
+
+    if (error instanceof ConcurrentRequestInProgressError) {
+      telemetry.addLog(span.spanId, 'warn', 'Concurrent duplicate payout request in progress', {
+        idempotencyKey,
+      });
+      telemetry.finishSpan(span.spanId, {
+        success: false,
+        error: error.message,
+      });
+      return NextResponse.json(
+        {
+          success: false,
+          message: 'A request with this idempotency key is currently in progress',
+        },
+        { status: 409 },
+      );
+    }
+
     Sentry.captureException(error, {
       tags: {
         endpoint: '/api/initiate-transfer',

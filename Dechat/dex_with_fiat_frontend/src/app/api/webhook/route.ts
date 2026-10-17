@@ -1,10 +1,13 @@
 import { NextRequest, NextResponse } from 'next/server';
-import crypto from 'crypto';
 import { telemetry } from '@/lib/telemetry';
-import { isReplayEvent } from '@/lib/transferStore';
-import { getTransferStatus, setTransferStatus } from '@/lib/transferStore';
-import { serverEnv as env } from '@/lib/serverEnv';
+import {
+  isReplayEvent,
+  getTransferStatus,
+  transitionPayoutStatus,
+  InvalidPayoutTransitionError,
+} from '@/lib/transferStore';
 import { publishPaymentStatus } from '@/lib/paymentStatusEvents';
+import { verifyWebhookSignature } from '@/lib/payout/webhookSignature';
 
 interface PaystackWebhookData {
   id?: string;
@@ -29,81 +32,52 @@ export async function POST(request: NextRequest) {
   );
 
   try {
-    const secretKey = env.PAYSTACK_SECRET_KEY;
-    // Fail-closed: reject immediately if the secret key is not configured.
-    // Never process a webhook without a verified signature.
-    if (!secretKey) {
-      telemetry.addLog(
-        span.spanId,
-        'error',
-        'Webhook rejected: PAYSTACK_SECRET_KEY is not configured',
-        { endpoint: '/api/webhook' },
-      );
-      telemetry.finishSpan(span.spanId, {
-        success: false,
-        error: 'Missing PAYSTACK_SECRET_KEY',
-      });
-      console.error('PAYSTACK_SECRET_KEY is not configured. Rejecting webhook.');
-      return NextResponse.json(
-        { message: 'Webhook processing is not configured' },
-        { status: 400 },
-      );
-    }
-
     telemetry.addLog(span.spanId, 'info', 'Starting webhook processing', {
       endpoint: '/api/webhook',
     });
 
     const payload = await request.text();
     const signature = request.headers.get('x-paystack-signature');
+    const timestamp =
+      request.headers.get('x-paystack-signature-timestamp') ||
+      request.headers.get('x-webhook-timestamp');
 
     telemetry.addLog(span.spanId, 'info', 'Webhook request parsed', {
       hasSignature: !!signature,
       payloadLength: payload.length,
     });
 
-    if (!signature) {
-      telemetry.addLog(span.spanId, 'warn', 'No signature provided', {
-        endpoint: '/api/webhook',
+    // Step 1: Verify exact raw payload using constant-time signature comparison.
+    // Rejects missing, malformed, stale, or invalid signatures without domain parsing.
+    const verification = verifyWebhookSignature({
+      rawPayload: payload,
+      signature,
+      timestamp,
+    });
+
+    if (!verification.valid) {
+      telemetry.addLog(span.spanId, 'error', 'Invalid webhook signature', {
+        error: verification.error,
+        message: verification.message,
       });
       telemetry.finishSpan(span.spanId, {
         success: false,
-        error: 'No signature provided',
+        error: verification.message ?? 'Invalid signature',
       });
 
+      console.error('Webhook signature verification failed:', verification.message);
+      const status = verification.error === 'missing_secret' ? 400 : 401;
       return NextResponse.json(
-        { message: 'No signature provided' },
-        { status: 401 },
+        { message: verification.message ?? 'Invalid signature' },
+        { status },
       );
     }
 
-    // Verify signature
-    telemetry.addLog(span.spanId, 'info', 'Verifying webhook signature', {
+    telemetry.addLog(span.spanId, 'info', 'Webhook signature verified', {
       endpoint: '/api/webhook',
     });
 
-    const hash = crypto
-      .createHmac('sha512', secretKey)
-      .update(payload)
-      .digest('hex');
-
-    if (hash !== signature) {
-      telemetry.addLog(span.spanId, 'error', 'Invalid webhook signature', {
-        expectedHash: hash,
-        receivedSignature: signature,
-      });
-      telemetry.finishSpan(span.spanId, {
-        success: false,
-        error: 'Invalid signature',
-      });
-
-      console.error('Invalid webhook signature');
-      return NextResponse.json(
-        { message: 'Invalid signature' },
-        { status: 401 },
-      );
-    }
-
+    // Step 2: Parse payload into domain state only AFTER signature verification has passed
     let event: PaystackWebhookEvent;
     try {
       event = JSON.parse(payload) as PaystackWebhookEvent;
@@ -123,10 +97,6 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    const _payloadHash = crypto
-      .createHash('sha256')
-      .update(payload)
-      .digest('hex');
     const dataId = event?.data?.id;
     const dataRef = event?.data?.reference;
     if (!dataId && !dataRef) {
@@ -144,113 +114,145 @@ export async function POST(request: NextRequest) {
     }
     const replayKey = `${event.event}:${dataId ?? dataRef}`;
 
-    telemetry.addLog(span.spanId, 'info', 'Webhook signature verified', {
-      eventType: event.event,
-      reference: event.data?.reference,
-      replayKey,
-    });
-
     console.log('Received Paystack webhook:', event.event);
 
-    // Handle different event types
+    // Step 3: Handle events with explicit payout lifecycle state transitions
     switch (event.event) {
       case 'transfer.success': {
         const data = event.data ?? {};
-        const existingRecord = getTransferStatus(data.reference ?? '');
+        const reference = data.reference ?? '';
+        const existingRecord = getTransferStatus(reference);
         const updatedAt = new Date().toISOString();
+
         telemetry.addLog(span.spanId, 'info', 'Processing transfer success', {
-          reference: data.reference,
+          reference,
           amount: data.amount,
           recipient: data.recipient,
           status: data.status,
         });
-        console.log('Transfer successful:', {
-          reference: data.reference,
-          amount: data.amount,
-          recipient: data.recipient,
-          status: data.status,
-        });
-        const nextRecord = setTransferStatus({
-          reference: data.reference ?? '',
-          status: 'success',
-          amount: data.amount,
-          updatedAt,
-          clientSessionId: existingRecord?.clientSessionId,
-        });
-        publishPaymentStatus(nextRecord.clientSessionId, {
-          reference: nextRecord.reference,
-          status: nextRecord.status,
-          amount: nextRecord.amount,
-          updatedAt,
-        });
+
+        try {
+          const nextRecord = transitionPayoutStatus({
+            reference,
+            targetStatus: 'success',
+            actor: 'webhook',
+            providerReference: data.id ?? reference,
+            reason: 'Webhook event transfer.success',
+            amount: data.amount,
+            clientSessionId: existingRecord?.clientSessionId,
+            timestamp: updatedAt,
+          });
+
+          publishPaymentStatus(nextRecord.clientSessionId, {
+            reference: nextRecord.reference,
+            status: nextRecord.status,
+            amount: nextRecord.amount,
+            updatedAt,
+          });
+        } catch (error) {
+          if (error instanceof InvalidPayoutTransitionError) {
+            telemetry.addLog(span.spanId, 'warn', 'Rejected invalid webhook transition', {
+              error: error.message,
+              reference,
+            });
+            console.warn('Rejected out-of-order webhook transition:', error.message);
+          } else {
+            throw error;
+          }
+        }
         break;
       }
 
       case 'transfer.failed': {
         const data = event.data ?? {};
-        const existingRecord = getTransferStatus(data.reference ?? '');
+        const reference = data.reference ?? '';
+        const existingRecord = getTransferStatus(reference);
         const updatedAt = new Date().toISOString();
+
         telemetry.addLog(span.spanId, 'warn', 'Processing transfer failure', {
-          reference: data.reference,
+          reference,
           amount: data.amount,
           recipient: data.recipient,
           status: data.status,
           failureReason: data.failure_reason,
         });
-        console.log('Transfer failed:', {
-          reference: data.reference,
-          amount: data.amount,
-          recipient: data.recipient,
-          status: data.status,
-          failure_reason: data.failure_reason,
-        });
-        const nextRecord = setTransferStatus({
-          reference: data.reference ?? '',
-          status: 'failed',
-          amount: data.amount,
-          failureReason: data.failure_reason,
-          updatedAt,
-          clientSessionId: existingRecord?.clientSessionId,
-        });
-        publishPaymentStatus(nextRecord.clientSessionId, {
-          reference: nextRecord.reference,
-          status: nextRecord.status,
-          amount: nextRecord.amount,
-          updatedAt,
-          failureReason: nextRecord.failureReason,
-        });
+
+        try {
+          const nextRecord = transitionPayoutStatus({
+            reference,
+            targetStatus: 'failed',
+            actor: 'webhook',
+            providerReference: data.id ?? reference,
+            reason: data.failure_reason ?? 'Webhook event transfer.failed',
+            amount: data.amount,
+            clientSessionId: existingRecord?.clientSessionId,
+            failureReason: data.failure_reason,
+            timestamp: updatedAt,
+          });
+
+          publishPaymentStatus(nextRecord.clientSessionId, {
+            reference: nextRecord.reference,
+            status: nextRecord.status,
+            amount: nextRecord.amount,
+            updatedAt,
+            failureReason: nextRecord.failureReason,
+          });
+        } catch (error) {
+          if (error instanceof InvalidPayoutTransitionError) {
+            telemetry.addLog(span.spanId, 'warn', 'Rejected invalid webhook transition', {
+              error: error.message,
+              reference,
+            });
+            console.warn('Rejected out-of-order webhook transition:', error.message);
+          } else {
+            throw error;
+          }
+        }
         break;
       }
 
       case 'transfer.reversed': {
         const data = event.data ?? {};
-        const existingRecord = getTransferStatus(data.reference ?? '');
+        const reference = data.reference ?? '';
+        const existingRecord = getTransferStatus(reference);
         const updatedAt = new Date().toISOString();
+
         telemetry.addLog(span.spanId, 'info', 'Processing transfer reversal', {
-          reference: data.reference,
+          reference,
           amount: data.amount,
           recipient: data.recipient,
           status: data.status,
         });
-        console.log('Transfer reversed:', {
-          reference: data.reference,
-          amount: data.amount,
-          recipient: data.recipient,
-          status: data.status,
-        });
-        const nextRecord = setTransferStatus({
-          reference: data.reference ?? '',
-          status: 'reversed',
-          amount: data.amount,
-          updatedAt,
-          clientSessionId: existingRecord?.clientSessionId,
-        });
-        publishPaymentStatus(nextRecord.clientSessionId, {
-          reference: nextRecord.reference,
-          status: nextRecord.status,
-          amount: nextRecord.amount,
-          updatedAt,
-        });
+
+        try {
+          const nextRecord = transitionPayoutStatus({
+            reference,
+            targetStatus: 'reversed',
+            actor: 'webhook',
+            providerReference: data.id ?? reference,
+            reason: 'Webhook event transfer.reversed',
+            amount: data.amount,
+            clientSessionId: existingRecord?.clientSessionId,
+            timestamp: updatedAt,
+          });
+
+          publishPaymentStatus(nextRecord.clientSessionId, {
+            reference: nextRecord.reference,
+            status: nextRecord.status,
+            amount: nextRecord.amount,
+            updatedAt,
+          });
+        } catch (error) {
+          if (error instanceof InvalidPayoutTransitionError) {
+            telemetry.addLog(span.spanId, 'warn', 'Rejected invalid webhook transition', {
+              error: error.message,
+              reference,
+            });
+            console.warn('Rejected out-of-order webhook transition:', error.message);
+          } else {
+            throw error;
+          }
+        }
         break;
       }
 

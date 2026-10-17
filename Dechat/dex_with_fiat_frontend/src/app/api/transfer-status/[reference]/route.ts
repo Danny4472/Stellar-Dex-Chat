@@ -1,5 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { getTransferStatus, setTransferStatus } from '@/lib/transferStore';
+import {
+  getTransferStatus,
+  setTransferStatus,
+  transitionPayoutStatus,
+} from '@/lib/transferStore';
 import { applyRateLimit, getClientIp } from '@/lib/rateLimit';
 
 const RATE_LIMIT = { maxRequests: 5, windowMs: 60_000 };
@@ -53,11 +57,12 @@ export async function POST(
     }
 
     cancelledTransfers.add(reference);
-    setTransferStatus({
+    transitionPayoutStatus({
       reference,
-      status: 'cancelled',
+      targetStatus: 'cancelled',
+      actor: 'user',
+      reason: 'User requested transfer cancellation',
       amount: existing?.amount ?? 0,
-      updatedAt: new Date().toISOString(),
       clientSessionId: existing?.clientSessionId,
       failureReason: existing?.failureReason,
     });
