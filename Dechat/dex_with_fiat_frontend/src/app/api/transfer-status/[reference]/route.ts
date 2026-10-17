@@ -1,19 +1,29 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { getTransferStatus, setTransferStatus } from '@/lib/transferStore';
+import { getTransferStatus } from '@/lib/transferStore';
 import { applyRateLimit, getClientIp } from '@/lib/rateLimit';
+import {
+  executeCancellationSaga,
+  getSagaStepsForPayout,
+} from '@/lib/payout/cancellationSaga';
+import {
+  createPayoutErrorResponse,
+  extractOrGenerateCorrelationId,
+  internalError,
+  validationError,
+  authorizationError,
+} from '@/lib/payout/errors';
 
 const RATE_LIMIT = { maxRequests: 5, windowMs: 60_000 };
-
-// Temporary memory store to mark cancellation requests.
-// In a full production app, this would update a database record.
-const cancelledTransfers = new Set<string>();
 
 export async function POST(
   request: NextRequest,
   { params }: { params: Promise<{ reference: string }> },
 ) {
+  const correlationId = extractOrGenerateCorrelationId(request.headers);
   const ip = getClientIp(request);
-  const limited = applyRateLimit(ip, '/api/transfer-status', RATE_LIMIT);
+  const limited = applyRateLimit(ip, '/api/transfer-status', RATE_LIMIT, {
+    correlationId,
+  });
   if (limited) return limited;
 
   try {
@@ -21,61 +31,73 @@ export async function POST(
     const { reference } = p;
 
     if (!reference) {
-      return NextResponse.json(
-        { success: false, message: 'Reference is required' },
-        { status: 400 },
-      );
+      return validationError({
+        message: 'Reference is required',
+        correlationId,
+        issues: [{ path: ['reference'], message: 'Reference is required' }],
+      });
     }
 
     const body = await request.json().catch(() => ({}));
-    const clientSessionId = body.clientSessionId as string | undefined;
+    const clientSessionId = (body as Record<string, unknown>).clientSessionId as
+      | string
+      | undefined;
+    const reason = (body as Record<string, unknown>).reason as
+      | string
+      | undefined;
 
-    const existing = getTransferStatus(reference);
-    if (!existing) {
-      return NextResponse.json(
-        { success: false, message: 'Transfer not found' },
-        { status: 404 },
-      );
-    }
-
-    if (existing.status !== 'pending') {
-      return NextResponse.json(
-        { success: false, message: 'Only pending transfers can be cancelled' },
-        { status: 409 },
-      );
-    }
-
-    if (clientSessionId && existing.clientSessionId !== clientSessionId) {
-      return NextResponse.json(
-        { success: false, message: 'Unauthorized' },
-        { status: 403 },
-      );
-    }
-
-    cancelledTransfers.add(reference);
-    setTransferStatus({
+    const sagaResult = await executeCancellationSaga({
       reference,
-      status: 'cancelled',
-      amount: existing?.amount ?? 0,
-      updatedAt: new Date().toISOString(),
-      clientSessionId: existing?.clientSessionId,
-      failureReason: existing?.failureReason,
+      clientSessionId,
+      reason,
     });
 
-    return NextResponse.json({
-      success: true,
-      data: {
-        reference,
-        status: 'cancelled',
-        message: 'Transfer cancellation requested successfully',
+    if (!sagaResult.success) {
+      if (sagaResult.status === 403) {
+        return authorizationError({
+          status: 403,
+          message: sagaResult.message,
+          correlationId,
+        });
+      }
+
+      return createPayoutErrorResponse({
+        status: sagaResult.status,
+        code: (sagaResult.code as any) || 'CANCELLATION_REJECTED',
+        userMessage: sagaResult.message,
+        category:
+          sagaResult.status === 404
+            ? 'validation'
+            : sagaResult.status === 403
+              ? 'authorization'
+              : 'provider',
+        retryable: false,
+        correlationId,
+      });
+    }
+
+    const response = NextResponse.json(
+      {
+        success: true,
+        data: sagaResult.data || {
+          reference,
+          status: sagaResult.outcome === 'provider_confirmed' ? 'cancelled' : 'pending',
+          outcome: sagaResult.outcome,
+          message: sagaResult.message,
+        },
       },
-    });
+      { status: sagaResult.status },
+    );
+
+    response.headers.set('X-Correlation-Id', correlationId);
+    return response;
   } catch (error: unknown) {
     console.error('Cancel transfer error:', error);
-    return NextResponse.json(
-      { success: false, message: 'Failed to cancel transfer' },
-      { status: 500 },
-    );
+    return internalError({
+      error,
+      correlationId,
+      message: 'Failed to cancel transfer',
+    });
   }
 }
 
@@ -83,50 +105,50 @@ export async function GET(
   request: NextRequest,
   { params }: { params: Promise<{ reference: string }> },
 ) {
+  const correlationId = extractOrGenerateCorrelationId(request.headers);
+
   try {
     const p = await params;
     const { reference } = p;
 
     if (!reference) {
-      return NextResponse.json(
-        { success: false, message: 'Reference is required' },
-        { status: 400 },
-      );
-    }
-
-    if (cancelledTransfers.has(reference)) {
-      const existing = getTransferStatus(reference);
-      return NextResponse.json({
-        success: true,
-        data: {
-          reference,
-          status: 'cancelled',
-          amount: existing?.amount ?? 0,
-          message: 'Transfer cancellation requested successfully',
-        },
+      return validationError({
+        message: 'Reference is required',
+        correlationId,
+        issues: [{ path: ['reference'], message: 'Reference is required' }],
       });
     }
 
     const transferRecord = getTransferStatus(reference);
+    const sagaSteps = getSagaStepsForPayout(reference);
+
     if (transferRecord) {
-      return NextResponse.json({
+      const response = NextResponse.json({
         success: true,
-        data: transferRecord,
+        data: {
+          ...transferRecord,
+          sagaSteps: sagaSteps.length > 0 ? sagaSteps : undefined,
+        },
       });
+      response.headers.set('X-Correlation-Id', correlationId);
+      return response;
     }
 
-    return NextResponse.json({
+    const response = NextResponse.json({
       success: true,
       data: {
         reference,
         status: 'pending',
       },
     });
+    response.headers.set('X-Correlation-Id', correlationId);
+    return response;
   } catch (error: unknown) {
     console.error('Get transfer status error:', error);
-    return NextResponse.json(
-      { success: false, message: 'Failed to retrieve transfer status' },
-      { status: 500 },
-    );
+    return internalError({
+      error,
+      correlationId,
+      message: 'Failed to retrieve transfer status',
+    });
   }
 }

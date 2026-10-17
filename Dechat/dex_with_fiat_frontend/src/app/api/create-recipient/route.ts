@@ -1,16 +1,27 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getPayoutProvider } from '@/lib/payout/providers/registry';
-import axios from 'axios';
 import { telemetry } from '@/lib/telemetry';
 import { applyRateLimit, getClientIp } from '@/lib/rateLimit';
-import { serverEnv as env } from '@/lib/serverEnv';
 import { createRecipientSchema } from '@/lib/apiSchemas';
+import {
+  extractOrGenerateCorrelationId,
+  validationError,
+  providerError,
+  internalError,
+  logStructuredError,
+} from '@/lib/payout/errors';
 
-const PAYSTACK_SECRET_KEY = env.PAYSTACK_SECRET_KEY;
-const RATE_LIMIT = { maxRequests: 5, windowMs: 60_000 };
+const RATE_LIMIT = {
+  maxRequests: 10,
+  windowMs: 60_000,
+  cost: 1,
+  burstLimit: 5,
+};
 
 export async function POST(request: NextRequest) {
+  const correlationId = extractOrGenerateCorrelationId(request.headers);
   const ip = getClientIp(request);
+
   const limited = applyRateLimit(ip, '/api/create-recipient', RATE_LIMIT);
   if (limited) return limited;
 
@@ -24,55 +35,56 @@ export async function POST(request: NextRequest) {
   try {
     telemetry.addLog(span.spanId, 'info', 'Starting recipient creation', {
       endpoint: '/api/create-recipient',
+      correlationId,
     });
 
     let body: unknown;
     try {
       body = await request.json();
     } catch {
-      telemetry.addLog(span.spanId, 'warn', 'Malformed JSON body');
+      telemetry.addLog(span.spanId, 'warn', 'Malformed JSON body', {
+        correlationId,
+      });
       telemetry.finishSpan(span.spanId, {
         success: false,
         error: 'Invalid JSON body',
       });
-      return NextResponse.json(
-        { success: false, message: 'Invalid JSON in request body.' },
-        { status: 400 },
-      );
+
+      return validationError({
+        message: 'Invalid JSON in request body.',
+        correlationId,
+        code: 'MALFORMED_REQUEST',
+      });
     }
 
-    // Validate with Zod
+    // Validate with strict server-side Zod schema
     const validationResult = createRecipientSchema.safeParse(body);
 
     if (!validationResult.success) {
       telemetry.addLog(span.spanId, 'warn', 'Zod validation failed', {
         errors: validationResult.error.issues,
+        correlationId,
       });
       telemetry.finishSpan(span.spanId, {
         success: false,
         error: 'Validation failed',
       });
 
-      return NextResponse.json(
-        {
-          success: false,
-          message: 'Validation failed',
-          errors: validationResult.error.issues,
-        },
-        { status: 400 },
-      );
+      return validationError({
+        message: 'Validation failed',
+        correlationId,
+        issues: validationResult.error.issues,
+      });
     }
 
-    const { type, name, account_number, bank_code, currency } =
+    const { type, name, account_number, bank_code, currency, description } =
       validationResult.data;
 
     telemetry.addLog(span.spanId, 'info', 'Request validated', {
       hasType: !!type,
       hasName: !!name,
-      hasAccountNumber: !!account_number,
-      hasBankCode: !!bank_code,
-      hasCurrency: !!currency,
-      currency: currency,
+      currency,
+      correlationId,
     });
 
     const provider = getPayoutProvider();
@@ -82,160 +94,56 @@ export async function POST(request: NextRequest) {
       account_number,
       bank_code,
       currency,
+      ...(description ? { description } : {}),
     });
 
-    return NextResponse.json({
+    telemetry.finishSpan(span.spanId, { success: true });
+
+    const apiResponse = NextResponse.json({
       success: true,
       data,
     });
-    if (!PAYSTACK_SECRET_KEY) {
-      telemetry.addLog(
-        span.spanId,
-        'warn',
-        'Using mock recipient creation (no API key)',
-        { endpoint: '/api/create-recipient' },
-      );
-
-      // Mock recipient creation when API key is missing
-      const mockRecipient = {
-        active: true,
-        createdAt: new Date().toISOString(),
-        currency: currency,
-        domain: 'test',
-        id: Math.floor(Math.random() * 1000000),
-        integration: 123456,
-        name: name,
-        recipient_code: `RCP_${Math.random().toString(36).substr(2, 9)}`,
-        type: type,
-        updatedAt: new Date().toISOString(),
-        is_deleted: false,
-        details: {
-          authorization_code: null,
-          account_number: account_number,
-          account_name: name,
-          bank_code: bank_code,
-          bank_name: 'Mock Bank',
-        },
-      };
-
-      await new Promise((resolve) => setTimeout(resolve, 1000));
-
-      telemetry.addLog(span.spanId, 'info', 'Mock recipient created', {
-        recipientCode: mockRecipient.recipient_code,
-        name: name,
-        currency: currency,
-      });
-      telemetry.finishSpan(span.spanId, { success: true, mock: true });
-
-      const response = NextResponse.json({
-        success: true,
-        data: mockRecipient,
-      });
-
-      telemetry.setTraceHeaders(response.headers, traceContext);
-      return response;
-    }
-
-    // Call real Paystack API to create recipient
-    telemetry.addLog(span.spanId, 'info', 'Calling Paystack API', {
-      endpoint: 'https://api.paystack.co/transferrecipient',
-      type: type,
-      currency: currency,
-      bank_code: bank_code,
+    apiResponse.headers.set('X-Correlation-Id', correlationId);
+    telemetry.setTraceHeaders(apiResponse.headers, traceContext);
+    return apiResponse;
+  } catch (error: unknown) {
+    logStructuredError('create-recipient', error, {
+      endpoint: '/api/create-recipient',
+      correlationId,
+      ip: getClientIp(request),
     });
 
-    const response = await axios.post(
-      'https://api.paystack.co/transferrecipient',
-      {
-        type: type,
-        name: name,
-        account_number: account_number,
-        bank_code: bank_code,
-        currency: currency,
-      },
-      {
-        headers: {
-          Authorization: `Bearer ${PAYSTACK_SECRET_KEY}`,
-          'Content-Type': 'application/json',
-        },
-      },
-    );
-
-    if (response.data.status && response.data.data) {
-      telemetry.addLog(
-        span.spanId,
-        'info',
-        'Paystack recipient creation successful',
-        {
-          recipientCode: response.data.data.recipient_code,
-          name: response.data.data.name,
-          currency: response.data.data.currency,
-        },
-      );
-      telemetry.finishSpan(span.spanId, { success: true });
-
-      const apiResponse = NextResponse.json({
-        success: true,
-        data: response.data.data,
-      });
-
-      telemetry.setTraceHeaders(apiResponse.headers, traceContext);
-      return apiResponse;
-    } else {
-      telemetry.addLog(span.spanId, 'error', 'Paystack API returned error', {
-        message: response.data.message,
-        status: response.data.status,
-      });
-      telemetry.finishSpan(span.spanId, {
-        success: false,
-        error: response.data.message,
-      });
-
-      return NextResponse.json(
-        {
-          success: false,
-          message: response.data.message || 'Failed to create recipient',
-        },
-        { status: 400 },
-      );
-    }
-  } catch (error: unknown) {
     telemetry.addLog(
       span.spanId,
       'error',
       'Unhandled error in recipient creation',
       {
         error: error instanceof Error ? error.message : 'Unknown error',
+        correlationId,
       },
     );
 
-    console.error('Create recipient error:', error);
-
-    // Handle Paystack API errors
-    if (
-      error &&
+    const httpError =
+      error !== null &&
       typeof error === 'object' &&
-      'response' in error &&
-      error.response &&
-      typeof error.response === 'object' &&
-      'data' in error.response &&
-      error.response.data &&
-      typeof error.response.data === 'object' &&
-      'message' in error.response.data
-    ) {
+      'response' in error
+        ? (error as {
+            response?: { status?: number; data?: { message?: string } };
+          })
+        : null;
+
+    if (httpError?.response?.data?.message) {
       telemetry.finishSpan(span.spanId, {
         success: false,
-        error: (error.response.data as { message: string }).message,
+        error: 'Provider error',
         errorType: 'paystack_api_error',
       });
-
-      return NextResponse.json(
-        {
-          success: false,
-          message: (error.response.data as { message: string }).message,
-        },
-        { status: 400 },
-      );
+      return providerError({
+        error,
+        correlationId,
+        safeMessage: 'Failed to create recipient at payment provider.',
+        status: 400,
+      });
     }
 
     telemetry.finishSpan(span.spanId, {
@@ -244,12 +152,10 @@ export async function POST(request: NextRequest) {
       errorType: 'unknown_error',
     });
 
-    return NextResponse.json(
-      {
-        success: false,
-        message: 'Failed to create recipient. Please try again.',
-      },
-      { status: 500 },
-    );
+    return internalError({
+      error,
+      correlationId,
+      message: 'Failed to create recipient. Please try again.',
+    });
   }
 }
