@@ -204,6 +204,32 @@ pub fn scale_floor(amount: i128, numerator: i128, denominator: i128) -> i128 {
     mul_div_floor(amount, numerator, denominator)
 }
 
+/// Normalizes a token amount to fiat USD cents given the oracle fixed-point price
+/// (scaled by [`FIXED_POINT`] = 10_000_000, 1 USD = 10^7) and the token's decimal precision.
+///
+/// Quota consumption uses mathematical ceiling rounding ([`checked_mul_div_ceil`]),
+/// ensuring any fractional cent is counted against the cap to prevent fractional limit bypass.
+///
+/// # Mathematical Specification:
+/// USD value in dollars: $\frac{\text{amount}}{10^{\text{decimals}}} \times \frac{\text{price}}{10^7}$
+/// USD value in cents: $\frac{\text{amount} \times \text{price} \times 100}{10^{\text{decimals}} \times 10^7} = \frac{\text{amount} \times \text{price}}{10^{\text{decimals}} \times 10^5}$
+/// Divisor: $10^{\text{decimals} + 5}$.
+///
+/// # Errors:
+/// * [`Error::InvalidAmount`] – If `decimals > 18`.
+/// * [`Error::Overflow`] – If intermediate product `amount * price` or divisor exceeds `i128::MAX`.
+pub fn normalize_to_usd_cents(amount: i128, price: i128, decimals: u32) -> Result<i128, Error> {
+    if decimals > 18 {
+        return Err(Error::InvalidAmount);
+    }
+    let total_exp = decimals.checked_add(5).ok_or(Error::Overflow)?;
+    let mut divisor: i128 = 1;
+    for _ in 0..total_exp {
+        divisor = divisor.checked_mul(10).ok_or(Error::Overflow)?;
+    }
+    checked_mul_div_ceil(amount, price, divisor)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -314,5 +340,61 @@ mod tests {
     fn mul_div_ceil_panics_on_overflow() {
         // Issue #966: ensure overflow is caught in ceil variant too
         mul_div_ceil(i128::MAX, 2, 1);
+    }
+
+    // ── normalize_to_usd_cents tests (Issues #23, #26) ───────────────────
+
+    #[test]
+    fn normalize_7_decimals_standard_token() {
+        // 1 token (10_000_000 stroops) at $1.00 (10_000_000) = 100 cents
+        let amount = 10_000_000;
+        let price = FIXED_POINT;
+        let cents = normalize_to_usd_cents(amount, price, 7).unwrap();
+        assert_eq!(cents, 100);
+    }
+
+    #[test]
+    fn normalize_6_decimals_usdc() {
+        // 1 USDC (1_000_000 units) at $1.00 (10_000_000) = 100 cents
+        let amount = 1_000_000;
+        let price = FIXED_POINT;
+        let cents = normalize_to_usd_cents(amount, price, 6).unwrap();
+        assert_eq!(cents, 100);
+    }
+
+    #[test]
+    fn normalize_18_decimals_large_precision() {
+        // 1 token (10^18 units) at $2000.00 (20_000_000_000) = 200,000 cents ($2,000)
+        let amount = 1_000_000_000_000_000_000;
+        let price = 20_000_000_000;
+        let cents = normalize_to_usd_cents(amount, price, 18).unwrap();
+        assert_eq!(cents, 200_000);
+    }
+
+    #[test]
+    fn normalize_0_decimals() {
+        // 1 token at $1.00 (10_000_000) = 100 cents
+        let amount = 1;
+        let price = FIXED_POINT;
+        let cents = normalize_to_usd_cents(amount, price, 0).unwrap();
+        assert_eq!(cents, 100);
+    }
+
+    #[test]
+    fn normalize_rejects_precision_above_18() {
+        assert_eq!(
+            normalize_to_usd_cents(100, FIXED_POINT, 19),
+            Err(Error::InvalidAmount)
+        );
+    }
+
+    #[test]
+    fn normalize_ceiling_rounding_conserves_quota() {
+        // 0.001 token with 6 decimals (1_000 units) at $1.00
+        // Exact value: 0.1 cents -> ceiling rounds to 1 cent
+        let amount = 1_000;
+        let price = FIXED_POINT;
+        let cents = normalize_to_usd_cents(amount, price, 6).unwrap();
+        assert_eq!(cents, 1);
     }
 }
