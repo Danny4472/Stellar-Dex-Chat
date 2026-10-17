@@ -7,6 +7,7 @@ import {
   useCallback,
   useEffect,
   useMemo,
+  useRef,
   ReactNode,
 } from 'react';
 import {
@@ -69,11 +70,20 @@ export interface WalletAccount {
   label?: string;
 }
 
+export interface BalanceFreshnessInfo {
+  source: 'rpc' | 'cache' | 'fallback';
+  lastFetchedAt: number | null;
+  isStale: boolean;
+  isPartial: boolean;
+  refreshing: boolean;
+}
+
 interface StellarWalletContextType {
   connection: StellarWalletConnection;
   accounts: WalletAccount[];
   selectedAccountIndex: number;
   xlmBalance: string;
+  balanceFreshness?: BalanceFreshnessInfo;
   selectAccount: (index: number) => Promise<void>;
   connect: () => Promise<void>;
   disconnect: () => void;
@@ -113,6 +123,14 @@ export function StellarWalletProvider({ children }: { children: ReactNode }) {
   const [error, setError] = useState<string | null>(null);
   const [sessionExpired, setSessionExpired] = useState(false);
   const [xlmBalance, setXlmBalance] = useState('');
+  const [balanceFreshness, setBalanceFreshness] = useState<BalanceFreshnessInfo>({
+    source: 'fallback',
+    lastFetchedAt: null,
+    isStale: false,
+    isPartial: false,
+    refreshing: false,
+  });
+  const refreshPromiseRef = useRef<Promise<void> | null>(null);
 
   useEffect(() => {
     const check = async () => {
@@ -441,12 +459,40 @@ export function StellarWalletProvider({ children }: { children: ReactNode }) {
 
   const refreshXlmBalance = useCallback(async () => {
     if (!connection.address) return;
-    try {
-      const balance = await fetchXlmBalance(connection.address);
-      setXlmBalance(balance);
-    } catch (error) {
-      console.error('Failed to refresh XLM balance:', error);
+    if (refreshPromiseRef.current) {
+      return refreshPromiseRef.current;
     }
+
+    setBalanceFreshness((prev) => ({ ...prev, refreshing: true }));
+
+    const promise = (async () => {
+      try {
+        const balance = await fetchXlmBalance(connection.address);
+        setXlmBalance(balance);
+        setBalanceFreshness({
+          source: 'rpc',
+          lastFetchedAt: Date.now(),
+          isStale: false,
+          isPartial: false,
+          refreshing: false,
+        });
+      } catch (error) {
+        console.error('Failed to refresh XLM balance:', error);
+        // Retain previous balance to avoid rendering valid balances as zero
+        setBalanceFreshness((prev) => ({
+          ...prev,
+          source: 'fallback',
+          isStale: true,
+          isPartial: true,
+          refreshing: false,
+        }));
+      } finally {
+        refreshPromiseRef.current = null;
+      }
+    })();
+
+    refreshPromiseRef.current = promise;
+    return promise;
   }, [connection.address]);
 
   const mockConnect = useCallback((addr: string) => {
@@ -494,12 +540,14 @@ export function StellarWalletProvider({ children }: { children: ReactNode }) {
       ...(mockWalletEnabled ? { mockConnect } : {}),
       isNetworkMismatch,
       refreshXlmBalance,
+      balanceFreshness,
     }),
     [
       connection,
       accounts,
       selectedAccountIndex,
       xlmBalance,
+      balanceFreshness,
       selectAccount,
       connect,
       disconnect,
