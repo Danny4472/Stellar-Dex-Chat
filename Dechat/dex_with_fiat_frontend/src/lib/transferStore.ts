@@ -54,19 +54,42 @@ export interface TransferStatusRecord {
   reference: string;
   status: 'pending' | 'success' | 'failed' | 'reversed' | 'cancelled';
   amount: number;
+  amountMinor?: bigint;
+  currency?: string;
   failureReason?: string;
   updatedAt: string;
   clientSessionId?: string;
+  ownerWallet?: string;
+  receiptId?: string;
+  withdrawalRequestId?: string;
+  providerReference?: string;
 }
 
 // Key is the transfer reference
 export const transferStore = new Map<string, TransferStatusRecord>();
 
-export function getTransferStatus(reference: string) {
+export function getTransferStatus(
+  reference: string,
+): TransferStatusRecord | undefined {
   return transferStore.get(reference);
 }
 
-export function setTransferStatus(record: TransferStatusRecord) {
+export function setTransferStatus(
+  record: TransferStatusRecord,
+): TransferStatusRecord {
   transferStore.set(record.reference, record);
   return record;
+}
+
+export function isTransferAuthorized(
+  record: TransferStatusRecord,
+  caller: {
+    type: 'wallet' | 'operator';
+    address?: string;
+    isOperator: boolean;
+  },
+): boolean {
+  if (caller.isOperator) return true;
+  if (!record.ownerWallet) return false;
+  return record.ownerWallet === caller.address;
 }

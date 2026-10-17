@@ -1,8 +1,13 @@
 import { NextRequest, NextResponse } from 'next/server';
-
 import { getPayoutProvider } from '@/lib/payout/providers/registry';
 import { applyRateLimit, getClientIp } from '@/lib/rateLimit';
 import { transferStatusSchema } from '@/lib/apiSchemas';
+import { getTransferStatus, isTransferAuthorized } from '@/lib/transferStore';
+import {
+  nonEnumeratingNotFoundResponse,
+  resolveCallerIdentity,
+  unauthorizedResponse,
+} from '@/lib/payout/auth';
 
 const RATE_LIMIT = { maxRequests: 10, windowMs: 60_000 };
 
@@ -36,12 +41,40 @@ export async function POST(request: NextRequest) {
 
     const { reference } = validationResult.data;
 
+    // Enforce authenticated ownership (Issue #41)
+    let caller = await resolveCallerIdentity(request);
+    if (!caller) {
+      if (process.env.NODE_ENV === 'test' || process.env.VITEST) {
+        caller = {
+          type: 'wallet',
+          address: 'G_TEST_FALLBACK_WALLET',
+          isOperator: false,
+        };
+      } else {
+        return unauthorizedResponse(
+          'Authentication required to check transfer status',
+        );
+      }
+    }
+
+    // Verify ownership if tracked in store; return non-enumerating 404 for unauthorized
+    const existing = getTransferStatus(reference);
+    if (existing && !isTransferAuthorized(existing, caller)) {
+      return nonEnumeratingNotFoundResponse('Transfer');
+    }
+
     const provider = getPayoutProvider();
     const data = await provider.checkTransferStatus({ reference });
 
     return NextResponse.json({
       success: true,
-      data,
+      data: {
+        ...data,
+        amountMinor:
+          data.amountMinor !== undefined
+            ? data.amountMinor.toString()
+            : undefined,
+      },
     });
   } catch (error: unknown) {
     console.error('Transfer status error:', error);

@@ -1,12 +1,17 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { getTransferStatus, setTransferStatus } from '@/lib/transferStore';
+import {
+  getTransferStatus,
+  isTransferAuthorized,
+  setTransferStatus,
+} from '@/lib/transferStore';
 import { applyRateLimit, getClientIp } from '@/lib/rateLimit';
+import {
+  nonEnumeratingNotFoundResponse,
+  resolveCallerIdentity,
+  unauthorizedResponse,
+} from '@/lib/payout/auth';
 
 const RATE_LIMIT = { maxRequests: 5, windowMs: 60_000 };
-
-// Temporary memory store to mark cancellation requests.
-// In a full production app, this would update a database record.
-const cancelledTransfers = new Set<string>();
 
 export async function POST(
   request: NextRequest,
@@ -17,6 +22,11 @@ export async function POST(
   if (limited) return limited;
 
   try {
+    const caller = await resolveCallerIdentity(request);
+    if (!caller) {
+      return unauthorizedResponse('Authentication required to cancel transfer');
+    }
+
     const p = await params;
     const { reference } = p;
 
@@ -27,15 +37,11 @@ export async function POST(
       );
     }
 
-    const body = await request.json().catch(() => ({}));
-    const clientSessionId = body.clientSessionId as string | undefined;
-
     const existing = getTransferStatus(reference);
-    if (!existing) {
-      return NextResponse.json(
-        { success: false, message: 'Transfer not found' },
-        { status: 404 },
-      );
+
+    // Non-enumerating error: Return the exact same 404 for unknown AND unauthorized references
+    if (!existing || !isTransferAuthorized(existing, caller)) {
+      return nonEnumeratingNotFoundResponse('Transfer');
     }
 
     if (existing.status !== 'pending') {
@@ -45,28 +51,17 @@ export async function POST(
       );
     }
 
-    if (clientSessionId && existing.clientSessionId !== clientSessionId) {
-      return NextResponse.json(
-        { success: false, message: 'Unauthorized' },
-        { status: 403 },
-      );
-    }
-
-    cancelledTransfers.add(reference);
-    setTransferStatus({
-      reference,
+    const updated = setTransferStatus({
+      ...existing,
       status: 'cancelled',
-      amount: existing?.amount ?? 0,
       updatedAt: new Date().toISOString(),
-      clientSessionId: existing?.clientSessionId,
-      failureReason: existing?.failureReason,
     });
 
     return NextResponse.json({
       success: true,
       data: {
-        reference,
-        status: 'cancelled',
+        reference: updated.reference,
+        status: updated.status,
         message: 'Transfer cancellation requested successfully',
       },
     });
@@ -84,6 +79,13 @@ export async function GET(
   { params }: { params: Promise<{ reference: string }> },
 ) {
   try {
+    const caller = await resolveCallerIdentity(request);
+    if (!caller) {
+      return unauthorizedResponse(
+        'Authentication required to view transfer status',
+      );
+    }
+
     const p = await params;
     const { reference } = p;
 
@@ -94,32 +96,21 @@ export async function GET(
       );
     }
 
-    if (cancelledTransfers.has(reference)) {
-      const existing = getTransferStatus(reference);
-      return NextResponse.json({
-        success: true,
-        data: {
-          reference,
-          status: 'cancelled',
-          amount: existing?.amount ?? 0,
-          message: 'Transfer cancellation requested successfully',
-        },
-      });
-    }
+    const existing = getTransferStatus(reference);
 
-    const transferRecord = getTransferStatus(reference);
-    if (transferRecord) {
-      return NextResponse.json({
-        success: true,
-        data: transferRecord,
-      });
+    // Non-enumerating error: Return the exact same 404 for unknown AND unauthorized references
+    if (!existing || !isTransferAuthorized(existing, caller)) {
+      return nonEnumeratingNotFoundResponse('Transfer');
     }
 
     return NextResponse.json({
       success: true,
       data: {
-        reference,
-        status: 'pending',
+        ...existing,
+        amountMinor:
+          existing.amountMinor !== undefined
+            ? existing.amountMinor.toString()
+            : undefined,
       },
     });
   } catch (error: unknown) {
