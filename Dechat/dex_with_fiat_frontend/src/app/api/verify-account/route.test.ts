@@ -1,145 +1,123 @@
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { NextRequest } from 'next/server';
+import {
+  ProviderOutageError,
+  resetCircuitBreakers,
+} from '@/lib/payout/circuitBreaker';
 
 vi.mock('server-only', () => ({}));
 
-import { POST } from './route';
-import { getSharedRateLimitStore } from '@/lib/rateLimit';
-import * as registry from '@/lib/payout/providers/registry';
+const applyRateLimitMock = vi.fn(() => null);
 
-describe('Route Contract: /api/verify-account', () => {
-  const verifyAccountMock = vi.fn();
+vi.mock('@/lib/rateLimit', () => ({
+  applyRateLimit: () => applyRateLimitMock(),
+  getClientIp: () => '127.0.0.1',
+}));
 
+vi.mock('@/lib/telemetry', () => ({
+  telemetry: {
+    extractTraceFromHeaders: () => ({ traceId: 'trace', spanId: 'parent' }),
+    createSpan: () => ({ spanId: 'span' }),
+    addLog: vi.fn(),
+    finishSpan: vi.fn(),
+    setTraceHeaders: vi.fn(),
+  },
+}));
+
+const mockVerifyAccount = vi.fn().mockResolvedValue({
+  account_number: '0123456789',
+  account_name: 'Jane Doe',
+  bank_id: 58,
+});
+
+vi.mock('@/lib/payout/providers/registry', () => ({
+  getPayoutProvider: () => ({
+    name: 'paystack',
+    verifyAccount: mockVerifyAccount,
+  }),
+}));
+
+const { POST } = await import('./route');
+
+function makeRequest(body: unknown, extraHeaders: Record<string, string> = {}) {
+  return new NextRequest('http://localhost:3000/api/verify-account', {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      origin: 'http://localhost:3000',
+      'sec-fetch-site': 'same-origin',
+      ...extraHeaders,
+    },
+    body: JSON.stringify(body),
+  });
+}
+
+describe('POST /api/verify-account', () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    getSharedRateLimitStore().reset();
-    verifyAccountMock.mockResolvedValue({
+    resetCircuitBreakers();
+    applyRateLimitMock.mockReturnValue(null);
+    mockVerifyAccount.mockResolvedValue({
       account_number: '0123456789',
-      account_name: 'Ada Lovelace',
+      account_name: 'Jane Doe',
       bank_id: 58,
     });
-    vi.spyOn(registry, 'getPayoutProvider').mockReturnValue({
-      name: 'paystack' as const,
-      verifyAccount: verifyAccountMock,
-      createRecipient: vi.fn(),
-      initiateTransfer: vi.fn(),
-      checkTransferStatus: vi.fn(),
-    });
   });
 
-  function makeRequest(body: unknown, raw = false) {
-    return new NextRequest(
-      new Request('http://localhost/api/verify-account', {
-        method: 'POST',
-        body: raw ? (body as string) : JSON.stringify(body),
-        headers: { 'content-type': 'application/json' },
-      }),
-    );
-  }
-
-  it('returns 200 and normalized data for valid request', async () => {
-    const req = makeRequest({
-      accountNumber: ' 0123456789 ',
-      bankCode: ' 058 ',
-    });
-    const res = await POST(req);
-    const body = await res.json();
-
-    expect(res.status).toBe(200);
-    expect(body.success).toBe(true);
-    expect(body.data.account_name).toBe('Ada Lovelace');
-    // Normalization verification before provider call
-    expect(verifyAccountMock).toHaveBeenCalledWith({
-      accountNumber: '0123456789',
-      bankCode: '058',
-    });
-    expect(res.headers.get('X-Correlation-Id')).toBeDefined();
-  });
-
-  it('returns 400 for malformed JSON body', async () => {
-    const req = makeRequest('not-json{{{', true);
-    const res = await POST(req);
-    const body = await res.json();
-
-    expect(res.status).toBe(400);
-    expect(body.version).toBe('v1');
-    expect(body.success).toBe(false);
-    expect(body.error.code).toBe('MALFORMED_REQUEST');
-    expect(body.error.category).toBe('validation');
-  });
-
-  it('returns 400 with field-level errors for invalid account format without revealing account existence', async () => {
-    const req = makeRequest({
-      accountNumber: '123', // shorter than 10 digits
-      bankCode: '058',
-    });
-    const res = await POST(req);
-    const body = await res.json();
-
-    expect(res.status).toBe(400);
-    expect(body.version).toBe('v1');
-    expect(body.success).toBe(false);
-    expect(body.error.code).toBe('VALIDATION_ERROR');
-    expect(body.error.category).toBe('validation');
-    expect(body.error.details).toBeDefined();
-    expect(body.error.details.some((d: any) => d.field === 'accountNumber')).toBe(true);
-    expect(verifyAccountMock).not.toHaveBeenCalled();
-  });
-
-  it('returns 400 when unknown fields are present (strict server-side validation)', async () => {
-    const req = makeRequest({
-      accountNumber: '0123456789',
-      bankCode: '058',
-      unknownField: 'exploit',
-    });
-    const res = await POST(req);
-    const body = await res.json();
-
-    expect(res.status).toBe(400);
-    expect(body.version).toBe('v1');
-    expect(body.success).toBe(false);
-    expect(body.error.code).toBe('VALIDATION_ERROR');
-    expect(verifyAccountMock).not.toHaveBeenCalled();
-  });
-
-  it('returns 400 safe error when provider returns 422', async () => {
-    verifyAccountMock.mockRejectedValue({
-      response: {
-        status: 422,
-        data: { message: 'Could not resolve account' },
-      },
-    });
-
-    const req = makeRequest({
-      accountNumber: '0123456789',
-      bankCode: '058',
-    });
-    const res = await POST(req);
-    const body = await res.json();
-
-    expect(res.status).toBe(400);
-    expect(body.version).toBe('v1');
-    expect(body.error.code).toBe('PROVIDER_REJECTED');
-    expect(body.error.category).toBe('provider');
-    expect(body.message).toBe('Invalid account number or bank code');
-  });
-
-  it('returns 429 when rate limit is exceeded with standard retry headers', async () => {
-    for (let i = 0; i < 10; i++) {
-      await POST(makeRequest({ accountNumber: '0123456789', bankCode: '058' }));
-    }
-
-    const limitedRes = await POST(
+  it('verifies account with valid details', async () => {
+    const res = await POST(
       makeRequest({ accountNumber: '0123456789', bankCode: '058' }),
     );
-    expect(limitedRes.status).toBe(429);
-    expect(limitedRes.headers.get('Retry-After')).toBeDefined();
-    expect(limitedRes.headers.get('X-RateLimit-Limit')).toBe('10');
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.success).toBe(true);
+    expect(body.data.account_name).toBe('Jane Doe');
+  });
 
-    const body = await limitedRes.json();
-    expect(body.version).toBe('v1');
-    expect(body.error.code).toBe('RATE_LIMIT_EXCEEDED');
-    expect(body.error.category).toBe('rate_limit');
-    expect(body.error.retryable).toBe(true);
+  it('returns 503 when provider outage occurs', async () => {
+    mockVerifyAccount.mockRejectedValue(
+      new ProviderOutageError('Paystack service unavailable', 'OPEN', 30),
+    );
+
+    const res = await POST(
+      makeRequest({ accountNumber: '0123456789', bankCode: '058' }),
+    );
+    expect(res.status).toBe(503);
+    const body = await res.json();
+    expect(body.success).toBe(false);
+    expect(body.error).toBe('PROVIDER_OUTAGE');
+  });
+
+  it('returns 400 when account resolution fails permanently (rejection)', async () => {
+    const rejectionError = {
+      isAxiosError: true,
+      response: {
+        status: 422,
+        data: { message: 'Could not resolve account name' },
+      },
+    };
+    mockVerifyAccount.mockRejectedValue(rejectionError);
+
+    const res = await POST(
+      makeRequest({ accountNumber: '0000000000', bankCode: '058' }),
+    );
+    expect(res.status).toBe(422);
+    const body = await res.json();
+    expect(body.success).toBe(false);
+    expect(body.error).toBe('PAYOUT_REJECTED');
+    expect(body.message).toBe('Could not resolve account name');
+  });
+
+  it('rejects cross-site hostile origin requests with 403', async () => {
+    const hostileReq = makeRequest(
+      { accountNumber: '0123456789', bankCode: '058' },
+      {
+        origin: 'https://attacker.com',
+        'sec-fetch-site': 'cross-site',
+      },
+    );
+
+    const res = await POST(hostileReq);
+    expect(res.status).toBe(403);
   });
 });

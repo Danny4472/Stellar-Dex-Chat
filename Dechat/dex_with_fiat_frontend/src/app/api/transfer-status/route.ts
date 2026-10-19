@@ -2,13 +2,11 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getPayoutProvider } from '@/lib/payout/providers/registry';
 import { applyRateLimit, getClientIp } from '@/lib/rateLimit';
 import { transferStatusSchema } from '@/lib/apiSchemas';
+import { enforcePayoutRouteSecurity } from '@/lib/payout/security';
 import {
-  extractOrGenerateCorrelationId,
-  validationError,
-  providerError,
-  internalError,
-  logStructuredError,
-} from '@/lib/payout/errors';
+  getProviderCircuitBreaker,
+  handlePayoutApiError,
+} from '@/lib/payout/circuitBreaker';
 
 const RATE_LIMIT = {
   maxRequests: 15,
@@ -17,8 +15,18 @@ const RATE_LIMIT = {
   burstLimit: 8,
 };
 
+export async function OPTIONS(request: NextRequest) {
+  return (
+    enforcePayoutRouteSecurity(request) ||
+    new NextResponse(null, { status: 204 })
+  );
+}
+
 export async function POST(request: NextRequest) {
-  const correlationId = extractOrGenerateCorrelationId(request.headers);
+  // Enforce payout API security
+  const securityBlocked = enforcePayoutRouteSecurity(request);
+  if (securityBlocked) return securityBlocked;
+
   const ip = getClientIp(request);
 
   const limited = applyRateLimit(ip, '/api/transfer-status', RATE_LIMIT);
@@ -46,9 +54,26 @@ export async function POST(request: NextRequest) {
     }
 
     const { reference } = validationResult.data;
+    const bodyRecord = body as Record<string, unknown>;
+    const clientSessionId =
+      request.headers.get('x-client-session-id') ||
+      (typeof bodyRecord.clientSessionId === 'string'
+        ? bodyRecord.clientSessionId
+        : undefined);
+
+    // IDOR check: verify caller is authorized for this reference.
+    // If unauthorized, return 404 immediately without calling the provider!
+    const auth = authorizeTransferAccess(request, reference, clientSessionId);
+    if (!auth.authorized) {
+      return uniformNotFoundResponse();
+    }
 
     const provider = getPayoutProvider();
-    const data = await provider.checkTransferStatus({ reference });
+    const breaker = getProviderCircuitBreaker(provider.name);
+
+    const data = await breaker.execute(() =>
+      provider.checkTransferStatus({ reference }),
+    );
 
     const response = NextResponse.json({
       success: true,
@@ -63,28 +88,14 @@ export async function POST(request: NextRequest) {
       ip: getClientIp(request),
     });
 
-    const httpError =
-      error !== null &&
-      typeof error === 'object' &&
-      'response' in error
-        ? (error as {
-            response?: { status?: number; data?: { message?: string } };
-          })
-        : null;
-
-    if (httpError?.response?.data?.message) {
-      return providerError({
-        error,
-        correlationId,
-        safeMessage: 'Failed to fetch transfer status from provider.',
-        status: 400,
-      });
-    }
-
-    return internalError({
+    const errorDetails = handlePayoutApiError(
       error,
-      correlationId,
-      message: 'Failed to fetch transfer status. Please try again.',
+      'Failed to fetch transfer status. Please try again.',
+    );
+
+    return NextResponse.json(errorDetails.body, {
+      status: errorDetails.status,
+      headers: errorDetails.headers,
     });
   }
 }

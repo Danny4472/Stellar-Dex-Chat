@@ -1,19 +1,15 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { getTransferStatus } from '@/lib/transferStore';
+import { setTransferStatus } from '@/lib/transferStore';
 import { applyRateLimit, getClientIp } from '@/lib/rateLimit';
 import {
-  executeCancellationSaga,
-  getSagaStepsForPayout,
-} from '@/lib/payout/cancellationSaga';
-import {
-  createPayoutErrorResponse,
-  extractOrGenerateCorrelationId,
-  internalError,
-  validationError,
-  authorizationError,
-} from '@/lib/payout/errors';
+  authorizeTransferAccess,
+  uniformNotFoundResponse,
+} from '@/lib/auth/authorizationMatrix';
 
 const RATE_LIMIT = { maxRequests: 5, windowMs: 60_000 };
+
+// Temporary memory store to mark cancellation requests.
+const cancelledTransfers = new Set<string>();
 
 export async function POST(
   request: NextRequest,
@@ -39,17 +35,34 @@ export async function POST(
     }
 
     const body = await request.json().catch(() => ({}));
-    const clientSessionId = (body as Record<string, unknown>).clientSessionId as
-      | string
-      | undefined;
-    const reason = (body as Record<string, unknown>).reason as
-      | string
-      | undefined;
+    const clientSessionId = body.clientSessionId as string | undefined;
 
-    const sagaResult = await executeCancellationSaga({
+    // IDOR check: authorize caller before performing cancellation or returning sensitive data.
+    // Denials return uniform 404 to avoid leaking record existence.
+    const auth = authorizeTransferAccess(request, reference, clientSessionId);
+    if (!auth.authorized || !auth.record) {
+      return uniformNotFoundResponse();
+    }
+
+    const existing = auth.record;
+    if (existing.status !== 'pending') {
+      return NextResponse.json(
+        { success: false, message: 'Only pending transfers can be cancelled' },
+        { status: 409 },
+      );
+    }
+
+    cancelledTransfers.add(reference);
+    setTransferStatus({
       reference,
-      clientSessionId,
-      reason,
+      status: 'cancelled',
+      amount: existing?.amount ?? 0,
+      updatedAt: new Date().toISOString(),
+      clientSessionId: existing?.clientSessionId,
+      failureReason: existing?.failureReason,
+      credentialVersion: existing?.credentialVersion,
+      timeoutOutcome: existing?.timeoutOutcome,
+      reconciled: existing?.reconciled,
     });
 
     if (!sagaResult.success) {
@@ -112,34 +125,36 @@ export async function GET(
     const { reference } = p;
 
     if (!reference) {
-      return validationError({
-        message: 'Reference is required',
-        correlationId,
-        issues: [{ path: ['reference'], message: 'Reference is required' }],
-      });
+      return NextResponse.json(
+        { success: false, message: 'Reference is required' },
+        { status: 400 },
+      );
     }
 
-    const transferRecord = getTransferStatus(reference);
-    const sagaSteps = getSagaStepsForPayout(reference);
+    // IDOR check: authorize caller before returning transfer status.
+    // Denials return uniform 404 to prevent probing and leaking record existence.
+    const auth = authorizeTransferAccess(request, reference);
+    if (!auth.authorized || !auth.record) {
+      return uniformNotFoundResponse();
+    }
 
-    if (transferRecord) {
-      const response = NextResponse.json({
+    const transferRecord = auth.record;
+
+    if (cancelledTransfers.has(reference)) {
+      return NextResponse.json({
         success: true,
         data: {
-          ...transferRecord,
-          sagaSteps: sagaSteps.length > 0 ? sagaSteps : undefined,
+          reference,
+          status: 'cancelled',
+          amount: transferRecord?.amount ?? 0,
+          message: 'Transfer cancellation requested successfully',
         },
       });
-      response.headers.set('X-Correlation-Id', correlationId);
-      return response;
     }
 
-    const response = NextResponse.json({
+    return NextResponse.json({
       success: true,
-      data: {
-        reference,
-        status: 'pending',
-      },
+      data: transferRecord,
     });
     response.headers.set('X-Correlation-Id', correlationId);
     return response;

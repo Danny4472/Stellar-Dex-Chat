@@ -3,23 +3,27 @@ import { getPayoutProvider } from '@/lib/payout/providers/registry';
 import { telemetry } from '@/lib/telemetry';
 import { applyRateLimit, getClientIp } from '@/lib/rateLimit';
 import { createRecipientSchema } from '@/lib/apiSchemas';
+import { enforcePayoutRouteSecurity } from '@/lib/payout/security';
 import {
-  extractOrGenerateCorrelationId,
-  validationError,
-  providerError,
-  internalError,
-  logStructuredError,
-} from '@/lib/payout/errors';
+  getProviderCircuitBreaker,
+  handlePayoutApiError,
+} from '@/lib/payout/circuitBreaker';
+import { getOrCreateBeneficiary } from '@/lib/payout/beneficiaryStore';
 
-const RATE_LIMIT = {
-  maxRequests: 10,
-  windowMs: 60_000,
-  cost: 1,
-  burstLimit: 5,
-};
+const RATE_LIMIT = { maxRequests: 5, windowMs: 60_000 };
+
+export async function OPTIONS(request: NextRequest) {
+  return (
+    enforcePayoutRouteSecurity(request) ||
+    new NextResponse(null, { status: 204 })
+  );
+}
 
 export async function POST(request: NextRequest) {
-  const correlationId = extractOrGenerateCorrelationId(request.headers);
+  // 1. Enforce payout API security: Origin, Sec-Fetch-Site, CSRF, and explicit CORS
+  const securityBlocked = enforcePayoutRouteSecurity(request);
+  if (securityBlocked) return securityBlocked;
+
   const ip = getClientIp(request);
 
   const limited = applyRateLimit(ip, '/api/create-recipient', RATE_LIMIT);
@@ -87,32 +91,51 @@ export async function POST(request: NextRequest) {
       correlationId,
     });
 
+    const userScope =
+      request.headers.get('x-user-scope') ||
+      request.headers.get('x-user-id') ||
+      ip;
+
     const provider = getPayoutProvider();
-    const data = await provider.createRecipient({
-      type,
-      name,
-      account_number,
-      bank_code,
-      currency,
-      ...(description ? { description } : {}),
-    });
+    const breaker = getProviderCircuitBreaker(provider.name);
+
+    // Race-safe beneficiary resolution with circuit breaker protection
+    const beneficiaryResult = await getOrCreateBeneficiary(
+      {
+        name,
+        accountNumber: account_number,
+        bankCode: bank_code,
+        currency,
+        userScope,
+        type,
+      },
+      () =>
+        breaker.execute(() =>
+          provider.createRecipient({
+            type,
+            name,
+            account_number,
+            bank_code,
+            currency,
+          }),
+        ),
+    );
 
     telemetry.finishSpan(span.spanId, { success: true });
 
     const apiResponse = NextResponse.json({
       success: true,
-      data,
+      data: {
+        recipient_code: beneficiaryResult.recipientCode,
+        name: beneficiaryResult.name,
+        reused: beneficiaryResult.reused,
+        recovered: beneficiaryResult.recovered,
+      },
     });
-    apiResponse.headers.set('X-Correlation-Id', correlationId);
+
     telemetry.setTraceHeaders(apiResponse.headers, traceContext);
     return apiResponse;
   } catch (error: unknown) {
-    logStructuredError('create-recipient', error, {
-      endpoint: '/api/create-recipient',
-      correlationId,
-      ip: getClientIp(request),
-    });
-
     telemetry.addLog(
       span.spanId,
       'error',
@@ -123,39 +146,19 @@ export async function POST(request: NextRequest) {
       },
     );
 
-    const httpError =
-      error !== null &&
-      typeof error === 'object' &&
-      'response' in error
-        ? (error as {
-            response?: { status?: number; data?: { message?: string } };
-          })
-        : null;
-
-    if (httpError?.response?.data?.message) {
-      telemetry.finishSpan(span.spanId, {
-        success: false,
-        error: 'Provider error',
-        errorType: 'paystack_api_error',
-      });
-      return providerError({
-        error,
-        correlationId,
-        safeMessage: 'Failed to create recipient at payment provider.',
-        status: 400,
-      });
-    }
+    const errorDetails = handlePayoutApiError(
+      error,
+      'Failed to create recipient. Please try again.',
+    );
 
     telemetry.finishSpan(span.spanId, {
       success: false,
-      error: 'Failed to create recipient. Please try again.',
-      errorType: 'unknown_error',
+      error: errorDetails.body.message,
     });
 
-    return internalError({
-      error,
-      correlationId,
-      message: 'Failed to create recipient. Please try again.',
+    return NextResponse.json(errorDetails.body, {
+      status: errorDetails.status,
+      headers: errorDetails.headers,
     });
   }
 }

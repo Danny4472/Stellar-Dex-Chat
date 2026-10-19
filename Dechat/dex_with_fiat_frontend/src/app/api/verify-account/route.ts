@@ -3,23 +3,26 @@ import { getPayoutProvider } from '@/lib/payout/providers/registry';
 import { telemetry } from '@/lib/telemetry';
 import { applyRateLimit, getClientIp } from '@/lib/rateLimit';
 import { verifyAccountSchema } from '@/lib/apiSchemas';
+import { enforcePayoutRouteSecurity } from '@/lib/payout/security';
 import {
-  extractOrGenerateCorrelationId,
-  validationError,
-  providerError,
-  internalError,
-  logStructuredError,
-} from '@/lib/payout/errors';
+  getProviderCircuitBreaker,
+  handlePayoutApiError,
+} from '@/lib/payout/circuitBreaker';
 
-const RATE_LIMIT = {
-  maxRequests: 10,
-  windowMs: 60_000,
-  cost: 1,
-  burstLimit: 5,
-};
+const RATE_LIMIT = { maxRequests: 10, windowMs: 60_000 };
+
+export async function OPTIONS(request: NextRequest) {
+  return (
+    enforcePayoutRouteSecurity(request) ||
+    new NextResponse(null, { status: 204 })
+  );
+}
 
 export async function POST(request: NextRequest) {
-  const correlationId = extractOrGenerateCorrelationId(request.headers);
+  // Enforce payout API security
+  const securityBlocked = enforcePayoutRouteSecurity(request);
+  if (securityBlocked) return securityBlocked;
+
   const ip = getClientIp(request);
 
   const limited = applyRateLimit(ip, '/api/verify-account', RATE_LIMIT);
@@ -88,7 +91,11 @@ export async function POST(request: NextRequest) {
     });
 
     const provider = getPayoutProvider();
-    const data = await provider.verifyAccount({ accountNumber, bankCode });
+    const breaker = getProviderCircuitBreaker(provider.name);
+
+    const data = await breaker.execute(() =>
+      provider.verifyAccount({ accountNumber, bankCode }),
+    );
 
     telemetry.finishSpan(span.spanId, { success: true });
 
@@ -113,53 +120,21 @@ export async function POST(request: NextRequest) {
       },
     );
 
-    const httpError =
-      error !== null &&
-      typeof error === 'object' &&
-      'response' in error
-        ? (error as {
-            response?: { status?: number; data?: { message?: string } };
-          })
-        : null;
+    console.error('Account verification error:', error);
 
-    if (httpError?.response?.status === 422) {
-      telemetry.finishSpan(span.spanId, {
-        success: false,
-        error: 'Invalid account number or bank code',
-        errorType: 'validation_error',
-      });
-      return providerError({
-        error,
-        correlationId,
-        safeMessage: 'Invalid account number or bank code',
-        status: 400,
-      });
-    }
-
-    if (httpError?.response?.data?.message) {
-      telemetry.finishSpan(span.spanId, {
-        success: false,
-        error: 'Provider error',
-        errorType: 'paystack_api_error',
-      });
-      return providerError({
-        error,
-        correlationId,
-        safeMessage: 'Account verification failed at provider. Please try again.',
-        status: 400,
-      });
-    }
+    const errorDetails = handlePayoutApiError(
+      error,
+      'Account verification failed. Please try again.',
+    );
 
     telemetry.finishSpan(span.spanId, {
       success: false,
-      error: 'Account verification failed. Please try again.',
-      errorType: 'unknown_error',
+      error: errorDetails.body.message,
     });
 
-    return internalError({
-      error,
-      correlationId,
-      message: 'Account verification failed. Please try again.',
+    return NextResponse.json(errorDetails.body, {
+      status: errorDetails.status,
+      headers: errorDetails.headers,
     });
   }
 }
