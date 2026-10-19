@@ -7,6 +7,7 @@ use soroban_sdk::{
 
 pub mod math;
 pub mod oracle;
+pub mod network_matrix;
 
 // ── Constants ─────────────────────────────────────────────────────────────
 pub const MIN_TTL: u32 = 518_400; // ~30 days
