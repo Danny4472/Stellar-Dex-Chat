@@ -19,8 +19,8 @@ jobs:
       !contains(github.event.pull_request.labels.*.name, 'security') &&
       !contains(github.event.pull_request.labels.*.name, 'dependencies')
     steps:
-      - name: Enable auto-merge
-        uses: peter-evans/enable-pull-request-automerge@v3
+      - name: Evaluate and merge
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           pull-request-number: ${{ github.event.pull_request.number }}

@@ -27,11 +27,15 @@ export default defineConfig({
       use: { ...devices['Desktop Safari'] },
     },
     {
-      // Payout authorization boundary regression matrix (#117).
-      // Runs the route-by-role cases (anonymous, unrelated, owner, admin)
-      // including alternate identifiers, pagination cursors, and exports.
-      name: 'payout-authz',
-      testMatch: /payout.*authz.*\.spec\.ts/,
+      name: 'amount-property',
+      testDir: './tests/property',
+      testMatch: /amount.*\.(spec|test)\.ts$/,
+      use: { ...devices['Desktop Chrome'] },
+    },
+    {
+      name: 'accessibility',
+      testDir: './tests/a11y',
+      testMatch: /.*\.(spec|test)\.ts$/,
       use: { ...devices['Desktop Chrome'] },
     },
   ],

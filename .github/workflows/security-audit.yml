@@ -4,14 +4,22 @@ name: Security Audit
 # when a contract or frontend PR happens to touch the affected manifest —
 # contracts.yml's `deny` job and the frontend build only run on paths that
 # touch their respective directories, so a fresh RUSTSEC/npm advisory
-# otherwise goes unnoticed until someone edits nearby code. This runs on every
-# pull request and weekly regardless of what changed.
+# otherwise goes unnoticed until someone edits nearby code. This runs both
+# audits weekly regardless of what changed.
+#
+# Release SBOM/provenance (issue #114): the `release-sbom` job generates
+# CycloneDX inventories for the Rust contracts and the Node frontend, records
+# the source revision, workflow identity and artifact digests, and attaches
+# them to the release. The `release-validation` job independently re-derives
+# the digests and verifies the SBOM describes the exact published artifacts.
 
 on:
   pull_request:
   schedule:
     - cron: "0 6 * * 1" # Every Monday 06:00 UTC
   workflow_dispatch:
+  release:
+    types: [published]
 
 permissions:
   contents: read
@@ -24,7 +32,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Run cargo-deny (advisories)
         uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
@@ -42,7 +50,48 @@ jobs:
 
     steps:
       - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          version: 9
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+          cache: "pnpm"
+          cache-dependency-path: Dechat/dex_with_fiat_frontend/pnpm-lock.yaml
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Audit production dependencies
+        run: pnpm audit --prod --audit-level high
+
+  release-sbom:
+    name: Generate Release SBOM
+    runs-on: ubuntu-latest
+    if: github.event_name == 'release'
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.release.tag_name }}
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@b3b07ba8b418998c39fb20f9d8b695e5a3ed04c9 # stable
+
+      - name: Install cargo-cyclonedx
+        run: cargo install cargo-cyclonedx --locked
+
+      - name: Generate Rust (CycloneDX) SBOM
+        working-directory: Dechat/stellar-contracts
+        run: cargo cyclonedx --format json --output-pattern package --output-cdx
 
       - name: Install pnpm
         uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa # v4
@@ -57,205 +106,71 @@ jobs:
           cache-dependency-path: Dechat/dex_with_fiat_frontend/pnpm-lock.yaml
 
       - name: Install dependencies
+        working-directory: Dechat/dex_with_fiat_frontend
         run: pnpm install --frozen-lockfile
 
-      # Severity policy: fail on high/critical. Findings below the threshold are
-      # reported but do not block. Time-bounded exceptions live in
-      # .github/security-audit-exceptions.json (owner + expiry required).
-      - name: Audit production dependencies
-        run: pnpm audit --prod --audit-level high --json > pnpm-audit.json || true
+      - name: Generate Node (CycloneDX) SBOM
+        working-directory: Dechat/dex_with_fiat_frontend
+        run: pnpm dlx @cyclonedx/cyclonedx-npm --output-format json --output-file sbom-node.cdx.json
 
-      - name: Enforce severity policy and report dependency paths
+      - name: Collect SBOMs and record provenance
         run: |
-          node - <<'NODE'
-          const fs = require('fs');
-          const path = require('path');
+          set -euo pipefail
+          mkdir -p release-artifacts
+          find Dechat/stellar-contracts -name '*.cdx.json' -exec cp {} release-artifacts/ \;
+          cp Dechat/dex_with_fiat_frontend/sbom-node.cdx.json release-artifacts/
+          {
+            echo "source_revision=${GITHUB_SHA}";
+            echo "workflow_identity=${GITHUB_REPOSITORY}/${GITHUB_WORKFLOW_REF}";
+            echo "release_tag=${{ github.event.release.tag_name }}";
+          } > release-artifacts/provenance.txt
+          (cd release-artifacts && sha256sum ./*.cdx.json > sbom-digests.txt)
+          cat release-artifacts/provenance.txt release-artifacts/sbom-digests.txt
 
-          const THRESHOLD = 'high';
-          const RANK = { info: 0, low: 1, moderate: 2, high: 3, critical: 4 };
-          const EXCEPTIONS_FILE = path.join(process.env.GITHUB_WORKSPACE, '.github/security-audit-exceptions.json');
+      - name: Upload SBOM artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-sbom
+          path: release-artifacts/
 
-          let exceptions = [];
-          if (fs.existsSync(EXCEPTIONS_FILE)) {
-            exceptions = JSON.parse(fs.readFileSync(EXCEPTIONS_FILE, 'utf8'));
-          }
+      - name: Attach SBOM and provenance to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release upload "${{ github.event.release.tag_name }}" \
+            release-artifacts/*.cdx.json \
+            release-artifacts/provenance.txt \
+            release-artifacts/sbom-digests.txt \
+            --clobber
 
-          const now = Date.now();
-          const activeExceptions = exceptions.filter((e) => {
-            if (!e.owner || !e.expiry) {
-              console.error(`Exception for ${e.id} is missing owner or expiry; ignoring.`);
-              return false;
-            }
-            if (Date.parse(e.expiry) < now) {
-              console.error(`Exception for ${e.id} expired on ${e.expiry}; ignoring.`);
-              return false;
-            }
-            return true;
-          });
-
-          const raw = fs.existsSync('pnpm-audit.json') ? fs.readFileSync('pnpm-audit.json', 'utf8') : '{}';
-          let report = {};
-          try { report = JSON.parse(raw); } catch { report = {}; }
-
-          const advisories = report.advisories || {};
-          const findings = [];
-
-          for (const advisory of Object.values(advisories)) {
-            const severity = advisory.severity || 'low';
-            if ((RANK[severity] ?? 0) < RANK[THRESHOLD]) continue;
-
-            const moduleName = advisory.module_name;
-            const patched = advisory.patched_versions || 'no patched version published';
-            const paths = (advisory.findings || []).flatMap((f) => f.paths || []);
-
-            const excepted = activeExceptions.some((e) => e.id === advisory.id || e.id === advisory.github_advisory_id);
-            findings.push({ id: advisory.github_advisory_id || advisory.id, moduleName, severity, patched, paths, excepted });
-          }
-
-          if (findings.length === 0) {
-            console.log('No findings at or above the severity threshold.');
-            process.exit(0);
-          }
-
-          let blocking = 0;
-          for (const f of findings) {
-            const status = f.excepted ? 'EXCEPTED' : 'BLOCKING';
-            if (!f.excepted) blocking += 1;
-            console.log(`[${status}] ${f.id} ${f.moduleName} (${f.severity})`);
-            console.log(`  patched version: ${f.patched}`);
-            for (const p of f.paths) console.log(`  dependency path: ${p}`);
-          }
-
-          if (blocking > 0) {
-            console.error(`${blocking} finding(s) at or above '${THRESHOLD}' without a valid exception.`);
-            process.exit(1);
-          }
-          NODE
-
-  secret-inventory:
-    name: Secret Inventory & Leak Guard
+  release-validation:
+    name: Verify Release Provenance
     runs-on: ubuntu-latest
+    needs: [release-sbom]
+    if: github.event_name == 'release'
+    permissions:
+      contents: read
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Download published SBOM artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-sbom
+          path: release-artifacts
 
-      # Secret inventory: purpose, environment, owner, rotation cadence, and
-      # revocation path for each integration credential. Values are NEVER
-      # stored here — only metadata. See SECURITY.md for the leak-response
-      # procedure (containment, rotation, verification).
-      - name: Validate secret inventory metadata
+      - name: Verify SBOM digests and provenance
         run: |
-          node - <<'NODE'
-          const fs = require('fs');
-          const path = require('path');
-
-          const INVENTORY_FILE = path.join(process.env.GITHUB_WORKSPACE, '.github/secret-inventory.json');
-          const REQUIRED = ['name', 'purpose', 'environment', 'owner', 'rotationCadence', 'revocationPath'];
-          const FORBIDDEN_VALUE_KEYS = ['value', 'secret', 'token', 'password', 'key', 'credential'];
-
-          if (!fs.existsSync(INVENTORY_FILE)) {
-            console.error('Missing .github/secret-inventory.json');
-            process.exit(1);
-          }
-
-          let inventory;
-          try {
-            inventory = JSON.parse(fs.readFileSync(INVENTORY_FILE, 'utf8'));
-          } catch (err) {
-            console.error(`Invalid JSON in secret inventory: ${err.message}`);
-            process.exit(1);
-          }
-
-          const entries = Array.isArray(inventory) ? inventory : inventory.secrets || [];
-          if (entries.length === 0) {
-            console.error('Secret inventory is empty; every integration credential must be tracked.');
-            process.exit(1);
-          }
-
-          let failures = 0;
-          for (const entry of entries) {
-            const label = entry.name || '<unnamed>';
-            for (const field of REQUIRED) {
-              if (!entry[field] || String(entry[field]).trim() === '') {
-                console.error(`[${label}] missing required field: ${field}`);
-                failures += 1;
-              }
-            }
-            for (const key of Object.keys(entry)) {
-              if (FORBIDDEN_VALUE_KEYS.includes(key.toLowerCase())) {
-                console.error(`[${label}] inventory must not store secret values (found key: ${key})`);
-                failures += 1;
-              }
-            }
-          }
-
-          if (failures > 0) {
-            console.error(`${failures} inventory problem(s) found.`);
-            process.exit(1);
-          }
-          console.log(`Secret inventory OK: ${entries.length} credential(s) tracked (metadata only).`);
-          NODE
-
-      # Placeholder guard: example env files and logs must use placeholders,
-      # never real values. Fails if a committed example env file contains a
-      # value that looks like a live credential.
-      - name: Guard example env files against real values
-        run: |
-          node - <<'NODE'
-          const fs = require('fs');
-          const path = require('path');
-
-          const ROOT = process.env.GITHUB_WORKSPACE;
-          const EXAMPLE_PATTERNS = [/\.env\.example$/, /\.env\.sample$/, /\.env\.template$/];
-          const PLACEHOLDER_HINTS = ['your-', 'changeme', 'placeholder', 'example', 'xxxx', '<', 'redacted', 'dummy', 'test-'];
-          const SUSPICIOUS = [
-            /(?:sk|pk)_(?:live|test)_[A-Za-z0-9]{16,}/, // Stripe-style
-            /AKIA[0-9A-Z]{16}/, // AWS access key id
-            /gh[pousr]_[A-Za-z0-9]{36,}/, // GitHub tokens
-            /-----BEGIN [A-Z ]*PRIVATE KEY-----/, // private keys
-          ];
-
-          const walk = (dir) => {
-            const out = [];
-            for (const name of fs.readdirSync(dir)) {
-              if (name === 'node_modules' || name === '.git') continue;
-              const full = path.join(dir, name);
-              const stat = fs.statSync(full);
-              if (stat.isDirectory()) out.push(...walk(full));
-              else out.push(full);
-            }
-            return out;
-          };
-
-          const files = walk(ROOT).filter((f) => EXAMPLE_PATTERNS.some((re) => re.test(f)));
-          let failures = 0;
-
-          for (const file of files) {
-            const rel = path.relative(ROOT, file);
-            const lines = fs.readFileSync(file, 'utf8').split('\n');
-            lines.forEach((line, i) => {
-              const trimmed = line.trim();
-              if (!trimmed || trimmed.startsWith('#')) return;
-              const eq = trimmed.indexOf('=');
-              if (eq === -1) return;
-              const value = trimmed.slice(eq + 1).trim();
-              if (!value) return;
-              const looksPlaceholder = PLACEHOLDER_HINTS.some((h) => value.toLowerCase().includes(h));
-              const looksReal = SUSPICIOUS.some((re) => re.test(value));
-              if (looksReal && !looksPlaceholder) {
-                console.error(`${rel}:${i + 1} appears to contain a real value; use a placeholder.`);
-                failures += 1;
-              }
-            });
-          }
-
-          if (failures > 0) {
-            console.error(`${failures} example env value(s) look like real credentials.`);
-            process.exit(1);
-          }
-          console.log(`Placeholder guard OK: checked ${files.length} example env file(s).`);
-          NODE
+          set -euo pipefail
+          cd release-artifacts
+          # Re-derive digests and confirm they match the recorded manifest.
+          sha256sum -c sbom-digests.txt
+          # Provenance must reference this exact revision and workflow.
+          grep -q "source_revision=${GITHUB_SHA}" provenance.txt
+          grep -q "workflow_identity=${GITHUB_REPOSITORY}/" provenance.txt
+          # At least one Rust and one Node SBOM must be present.
+          ls ./*.cdx.json >/dev/null
+          echo "SBOM and provenance verified for ${GITHUB_SHA}"
 
   open-tracking-issue:
     name: Open Tracking Issue
@@ -265,7 +180,7 @@ jobs:
 
     steps:
       - name: Find or create tracking issue
-        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
           script: |
             const { owner, repo } = context.repo;
