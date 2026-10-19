@@ -919,6 +919,10 @@ Repo Avatar
 - #112 security: publish a versioned threat model and abuse-case regi
 - #113 security(frontend): establish a restrictive Content Security P
 - #114 security(ci): generate and verify release SBOM and artifact pr
+- #127 test(frontend): property-test amount parsing, rounding, and lo
+- #128 test(accessibility): add automated checks to critical frontend
+- #129 ci(contract): detect stale client bindings and incompatible AB
+- #130 devex: provide a reproducible devcontainer for Rust, Stellar,
 
 ### Changed
 
@@ -1247,6 +1251,7 @@ Repo Avatar
 - **deps:** Bump the actions group with 9 updates
 - **changelog:** Update changelog [skip ci]
 - **deps-dev:** Bump @types/node from 25.9.5 to 26.6.5
+- **changelog:** Update changelog [skip ci]
 
 ### Deprecated
 
