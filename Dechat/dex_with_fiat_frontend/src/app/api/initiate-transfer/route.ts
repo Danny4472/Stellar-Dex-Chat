@@ -1,33 +1,45 @@
 import { NextRequest, NextResponse } from 'next/server';
+import crypto from 'crypto';
 import * as Sentry from '@sentry/nextjs';
 import { getPayoutProvider } from '@/lib/payout/providers/registry';
+import { credentialManager } from '@/lib/payout/credentialManager';
+import {
+  AmbiguousInitiationError,
+  ProviderTimeoutError,
+  sanitizeProviderError,
+} from '@/lib/payout/timeoutBudget';
+import { reconcileAmbiguousInitiation } from '@/lib/payout/reconciliation';
 import { telemetry } from '@/lib/telemetry';
 import { applyRateLimit, getClientIp } from '@/lib/rateLimit';
-import { transitionPayoutStatus } from '@/lib/transferStore';
+import { setTransferStatus, getTransferStatus } from '@/lib/transferStore';
 import { initiateTransferSchema } from '@/lib/apiSchemas';
-import {
-  executeIdempotentPayout,
-  IdempotencyPayloadMismatchError,
-  ConcurrentRequestInProgressError,
-} from '@/lib/payout/idempotency';
+import { payoutAuditLedger } from '@/lib/payout/auditLedger';
+import { payoutRetryQueue } from '@/lib/payout/retryQueue';
 
 const RATE_LIMIT = { maxRequests: 3, windowMs: 60_000 };
 
+const idempotencyCache = new Map<
+  string,
+  { result: unknown; timestamp: number }
+>();
+const IDEMPOTENCY_TTL_MS = 24 * 60 * 60 * 1000;
+
+export async function OPTIONS(request: NextRequest) {
+  return (
+    enforcePayoutRouteSecurity(request) ||
+    new NextResponse(null, { status: 204 })
+  );
+}
+
 export async function POST(request: NextRequest) {
+  // Enforce payout API security
+  const securityBlocked = enforcePayoutRouteSecurity(request);
+  if (securityBlocked) return securityBlocked;
+
   const ip = getClientIp(request);
+
   const limited = applyRateLimit(ip, '/api/initiate-transfer', RATE_LIMIT);
   if (limited) return limited;
-
-  const idempotencyKey =
-    request.headers.get('x-idempotency-key') ||
-    request.headers.get('idempotency-key');
-
-  if (!idempotencyKey) {
-    return NextResponse.json(
-      { success: false, message: 'X-Idempotency-Key header is required' },
-      { status: 400 },
-    );
-  }
 
   const traceContext = telemetry.extractTraceFromHeaders(request.headers);
   const span = telemetry.createSpan(
@@ -39,51 +51,72 @@ export async function POST(request: NextRequest) {
   try {
     telemetry.addLog(span.spanId, 'info', 'Starting transfer initiation', {
       endpoint: '/api/initiate-transfer',
+      correlationId,
     });
 
     let body: unknown;
     try {
       body = await request.json();
     } catch {
-      telemetry.addLog(span.spanId, 'warn', 'Malformed JSON body');
+      telemetry.addLog(span.spanId, 'warn', 'Malformed JSON body', {
+        correlationId,
+      });
       telemetry.finishSpan(span.spanId, {
         success: false,
         error: 'Invalid JSON body',
       });
-      return NextResponse.json(
-        { success: false, message: 'Invalid JSON in request body.' },
-        { status: 400 },
-      );
+
+      return validationError({
+        message: 'Invalid JSON in request body.',
+        correlationId,
+        code: 'MALFORMED_REQUEST',
+      });
     }
 
-    // Validate with Zod
+    // Validate with strict Zod schema
     const validationResult = initiateTransferSchema.safeParse(body);
 
     if (!validationResult.success) {
       telemetry.addLog(span.spanId, 'warn', 'Zod validation failed', {
         errors: validationResult.error.issues,
+        correlationId,
       });
       telemetry.finishSpan(span.spanId, {
         success: false,
         error: 'Validation failed',
       });
 
-      return NextResponse.json(
-        {
-          success: false,
-          message: 'Validation failed',
-          errors: validationResult.error.issues,
-        },
-        { status: 400 },
-      );
+      return validationError({
+        message: 'Validation failed',
+        correlationId,
+        issues: validationResult.error.issues,
+      });
     }
 
     const { source, reason, amount, recipient } = validationResult.data;
     const bodyRecord = body as Record<string, unknown>;
     const clientSessionId =
-      typeof bodyRecord.clientSessionId === 'string'
+      request.headers.get('x-client-session-id') ||
+      (typeof bodyRecord.clientSessionId === 'string'
         ? bodyRecord.clientSessionId
-        : undefined;
+        : undefined);
+
+    const activeCred = credentialManager.getActiveCredential();
+    const credentialVersion = activeCred?.version || 'v1';
+
+    // Idempotency key from header, body reference, or generated fallback
+    const headerIdempotencyKey = request.headers.get('X-Idempotency-Key');
+    const idempotencyKey =
+      headerIdempotencyKey ||
+      (typeof bodyRecord.reference === 'string' && bodyRecord.reference
+        ? bodyRecord.reference
+        : null) ||
+      `idem_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
+
+    const cached = idempotencyCache.get(idempotencyKey);
+    if (cached && Date.now() - cached.timestamp < IDEMPOTENCY_TTL_MS) {
+      return NextResponse.json({ success: true, data: cached.result });
+    }
 
     const userId =
       request.headers.get('x-user-id') ||
@@ -96,89 +129,128 @@ export async function POST(request: NextRequest) {
       hasSource: !!source,
       hasAmount: !!amount,
       hasRecipient: !!recipient,
-      amount,
+      amount: amount,
+      idempotencyKey,
     });
 
-    // Execute through idempotency layer scoped to user and payout intent
-    const { isRetry, data } = await executeIdempotentPayout({
-      idempotencyKey,
-      userId,
-      payload: { source, reason, amount, recipient },
-      execute: async () => {
-        const provider = getPayoutProvider();
-        const responseData = await provider.initiateTransfer({
-          source,
-          reason,
-          amount,
-          recipient,
-          reference: idempotencyKey, // Pass stable idempotency reference to provider
-        });
-
-        const transferReference =
-          typeof responseData.reference === 'string' && responseData.reference
-            ? responseData.reference
-            : idempotencyKey;
-
-        if (transferReference) {
-          transitionPayoutStatus({
-            reference: transferReference,
-            targetStatus: 'pending',
-            actor: 'user',
-            providerReference: transferReference,
-            reason: 'Payout initiation',
-            amount: Number(amount),
-            clientSessionId,
-          });
-        }
-
-        return responseData;
+    // Record immutable audit event for payout initiation (Issue #38)
+    payoutAuditLedger.recordEvent({
+      payoutId: idempotencyKey,
+      action: 'payout_initiated',
+      actor: clientSessionId ? `client:${clientSessionId}` : 'client:user',
+      requestCorrelationId: traceContext.traceId,
+      providerReference: idempotencyKey,
+      metadata: {
+        source,
+        reason,
+        amount: Number(amount),
+        recipient,
       },
     });
 
-    telemetry.addLog(span.spanId, 'info', 'Transfer initiation completed', {
-      isRetry,
-      reference: idempotencyKey,
-    });
-    telemetry.finishSpan(span.spanId, { success: true });
+    const provider = getPayoutProvider();
 
-    return NextResponse.json({
-      success: true,
-      data,
-    });
+    try {
+      const data = await provider.initiateTransfer({
+        source,
+        reason,
+        amount: Number(amount),
+        recipient,
+        reference: idempotencyKey,
+      });
+
+      const transferReference =
+        typeof data.reference === 'string' && data.reference
+          ? data.reference
+          : idempotencyKey;
+
+      if (transferReference) {
+        setTransferStatus({
+          reference: transferReference,
+          status: 'pending',
+          amount: Number(amount),
+          updatedAt: new Date().toISOString(),
+          clientSessionId,
+        });
+      }
+
+      // Record successful provider acceptance in audit ledger
+      payoutAuditLedger.recordEvent({
+        payoutId: transferReference,
+        action: 'payout_provider_accepted',
+        actor: 'provider:paystack',
+        requestCorrelationId: traceContext.traceId,
+        providerReference: transferReference,
+        metadata: { data: data as Record<string, unknown> },
+      });
+
+      idempotencyCache.set(idempotencyKey, {
+        result: data,
+        timestamp: Date.now(),
+      });
+
+      return NextResponse.json({
+        success: true,
+        data,
+      });
+    } catch (providerError: unknown) {
+      const errorMessage =
+        providerError instanceof Error
+          ? providerError.message
+          : 'Unknown provider error';
+
+      // Enqueue into durable retry queue instead of losing payout intent (Issue #37)
+      const retryJob = payoutRetryQueue.enqueueJob({
+        payoutId: idempotencyKey,
+        idempotencyKey,
+        payload: {
+          source,
+          amount: Number(amount),
+          recipient,
+          reason,
+        },
+        error: errorMessage,
+        correlationId: traceContext.traceId,
+      });
+
+      setTransferStatus({
+        reference: idempotencyKey,
+        status: 'pending',
+        amount: Number(amount),
+        updatedAt: new Date(now).toISOString(),
+        updatedAtMs: now,
+        clientSessionId,
+        failureReason: `Transient error: ${errorMessage}. Queued for retry.`,
+      });
+
+      telemetry.addLog(
+        span.spanId,
+        'warn',
+        'Provider call failed; enqueued into retry queue',
+        {
+          jobId: retryJob.id,
+          idempotencyKey,
+          error: errorMessage,
+        },
+      );
+
+      return NextResponse.json(
+        {
+          success: true,
+          status: 'queued_for_retry',
+          reference: idempotencyKey,
+          jobId: retryJob.id,
+          message: 'Transfer queued for retry due to provider failure',
+        },
+        { status: 202 },
+      );
+    }
   } catch (error: unknown) {
-    if (error instanceof IdempotencyPayloadMismatchError) {
-      telemetry.addLog(span.spanId, 'warn', 'Idempotency key reused with different payload', {
-        idempotencyKey,
-      });
-      telemetry.finishSpan(span.spanId, {
-        success: false,
-        error: error.message,
-      });
-      return NextResponse.json(
-        {
-          success: false,
-          message: 'Idempotency key reuse with different payload',
-        },
-        { status: 422 },
-      );
-    }
-
-    if (error instanceof ConcurrentRequestInProgressError) {
-      telemetry.addLog(span.spanId, 'warn', 'Concurrent duplicate payout request in progress', {
-        idempotencyKey,
-      });
-      telemetry.finishSpan(span.spanId, {
-        success: false,
-        error: error.message,
-      });
-      return NextResponse.json(
-        {
-          success: false,
-          message: 'A request with this idempotency key is currently in progress',
-        },
-        { status: 409 },
-      );
-    }
+    logStructuredError('initiate-transfer', error, {
+      endpoint: '/api/initiate-transfer',
+      correlationId,
+      ip: getClientIp(request),
+    });
 
     Sentry.captureException(error, {
       tags: {
@@ -186,36 +258,37 @@ export async function POST(request: NextRequest) {
         operation: 'transfer_initiation',
       },
       extra: {
-        ip,
+        ip: getClientIp(request),
+        correlationId,
         traceId: traceContext.traceId,
         spanId: span.spanId,
       },
     });
 
-    const errorMessage =
-      error instanceof Error ? error.message : 'Unknown error';
+    const sanitized = sanitizeProviderError(error, 'initiate', idempotencyKey);
 
     telemetry.addLog(
       span.spanId,
       'error',
       'Unhandled error in transfer initiation',
-      { error: errorMessage },
+      { error: sanitized.message, code: sanitized.code },
     );
 
     console.error('Initiate transfer error:', error);
 
+    const errorDetails = handlePayoutApiError(
+      error,
+      'Failed to initiate transfer. Please try again.',
+    );
+
     telemetry.finishSpan(span.spanId, {
       success: false,
-      error: 'Failed to initiate transfer. Please try again.',
-      errorType: 'unknown_error',
+      error: errorDetails.body.message,
     });
 
-    return NextResponse.json(
-      {
-        success: false,
-        message: 'Failed to initiate transfer. Please try again.',
-      },
-      { status: 500 },
-    );
+    return NextResponse.json(errorDetails.body, {
+      status: errorDetails.status,
+      headers: errorDetails.headers,
+    });
   }
 }

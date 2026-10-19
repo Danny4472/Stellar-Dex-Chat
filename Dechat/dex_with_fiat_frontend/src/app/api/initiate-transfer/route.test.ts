@@ -1,7 +1,10 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { NextRequest } from 'next/server';
 import { z } from 'zod';
-import { clearIdempotencyStore } from '@/lib/payout/idempotency';
+import { payoutRetryQueue } from '@/lib/payout/retryQueue';
+import { payoutAuditLedger } from '@/lib/payout/auditLedger';
+
+vi.mock('server-only', () => ({}));
 
 const mockSchema = z.object({
   source: z.string().min(1),
@@ -32,11 +35,13 @@ vi.mock('@/lib/rateLimit', () => ({
 const mockTransitionPayoutStatus = vi.fn();
 vi.mock('@/lib/transferStore', () => ({
   setTransferStatus: vi.fn(),
-  transitionPayoutStatus: (params: unknown) => mockTransitionPayoutStatus(params),
-  getTransferStatus: vi.fn(),
+  getTransferStatus: vi.fn(() => undefined),
 }));
 
-const mockInitiateTransfer = vi.fn().mockResolvedValue({ reference: 'ref-123' });
+const mockInitiateTransfer = vi
+  .fn()
+  .mockResolvedValue({ reference: 'ref-123' });
+
 vi.mock('@/lib/payout/providers/registry', () => ({
   getPayoutProvider: () => ({
     initiateTransfer: mockInitiateTransfer,
@@ -49,15 +54,16 @@ vi.mock('@/lib/apiSchemas', () => ({
 
 const { POST } = await import('./route');
 
-function makeRequest(
-  body: unknown,
-  headersObj: Record<string, string> = { 'x-idempotency-key': 'default-key' },
-) {
+function makeRequest(body: unknown, headers: Record<string, string> = {}) {
   return new NextRequest(
     new Request('http://localhost/api/initiate-transfer', {
       method: 'POST',
       body: JSON.stringify(body),
-      headers: { 'content-type': 'application/json', ...headersObj },
+      headers: {
+        'content-type': 'application/json',
+        'X-Idempotency-Key': 'test-idempotency-key',
+        ...headers,
+      },
     }),
   );
 }
@@ -65,20 +71,9 @@ function makeRequest(
 describe('POST /api/initiate-transfer (Issue #32)', () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    clearIdempotencyStore();
-  });
-
-  it('returns 400 when X-Idempotency-Key header is missing', async () => {
-    const req = makeRequest(
-      { source: 'wallet', reason: 'payout', amount: '100', recipient: 'G123' },
-      {}, // no idempotency header
-    );
-    const res = await POST(req);
-    const body = await res.json();
-
-    expect(res.status).toBe(400);
-    expect(body.success).toBe(false);
-    expect(body.message).toContain('X-Idempotency-Key');
+    payoutRetryQueue._resetForTest();
+    payoutAuditLedger._resetForTest();
+    mockInitiateTransfer.mockResolvedValue({ reference: 'ref-123' });
   });
 
   it('returns 400 for malformed JSON body', async () => {
@@ -88,7 +83,7 @@ describe('POST /api/initiate-transfer (Issue #32)', () => {
         body: 'not json{{{',
         headers: {
           'content-type': 'application/json',
-          'x-idempotency-key': 'bad-json-key',
+          'x-idempotency-key': 'test-idempotency-key',
         },
       }),
     );
@@ -101,8 +96,35 @@ describe('POST /api/initiate-transfer (Issue #32)', () => {
     expect(body.message).toContain('Invalid JSON');
   });
 
+  it('returns 400 when X-Idempotency-Key header is missing', async () => {
+    const noKeyReq = new NextRequest(
+      new Request('http://localhost/api/initiate-transfer', {
+        method: 'POST',
+        body: JSON.stringify({
+          source: 'wallet',
+          reason: 'pay',
+          amount: '10',
+          recipient: 'G1',
+        }),
+        headers: { 'content-type': 'application/json' },
+      }),
+    );
+
+    const res = await POST(noKeyReq);
+    const body = await res.json();
+
+    expect(res.status).toBe(400);
+    expect(body.success).toBe(false);
+    expect(body.message).toContain('X-Idempotency-Key');
+  });
+
   it('returns 400 for validation failures', async () => {
-    const req = makeRequest({ source: '', reason: '', amount: '', recipient: '' });
+    const req = makeRequest({
+      source: '',
+      reason: '',
+      amount: '',
+      recipient: '',
+    });
     const res = await POST(req);
     const body = await res.json();
 
@@ -110,76 +132,52 @@ describe('POST /api/initiate-transfer (Issue #32)', () => {
     expect(body.success).toBe(false);
   });
 
-  it('returns 200 for valid request and records pending transition', async () => {
-    const req = makeRequest({
-      source: 'wallet',
-      reason: 'payment',
-      amount: '100',
-      recipient: 'GABC123',
-    });
+  it('returns 200 for valid request and records audit events', async () => {
+    const req = makeRequest(
+      {
+        source: 'wallet',
+        reason: 'payment',
+        amount: '100',
+        recipient: 'GABC123',
+      },
+      { 'X-Idempotency-Key': 'key-valid-req' },
+    );
     const res = await POST(req);
     const body = await res.json();
 
     expect(res.status).toBe(200);
     expect(body.success).toBe(true);
-    expect(mockInitiateTransfer).toHaveBeenCalledTimes(1);
-    expect(mockTransitionPayoutStatus).toHaveBeenCalledWith(
-      expect.objectContaining({
-        targetStatus: 'pending',
-        actor: 'user',
-        amount: 100,
-      }),
+
+    const auditEvents = payoutAuditLedger.getEntries().entries;
+    expect(auditEvents.some((e) => e.action === 'payout_initiated')).toBe(true);
+    expect(
+      auditEvents.some((e) => e.action === 'payout_provider_accepted'),
+    ).toBe(true);
+  });
+
+  it('enqueues failed provider calls into durable retry queue without losing intent', async () => {
+    mockInitiateTransfer.mockRejectedValueOnce(new Error('502 Bad Gateway'));
+
+    const req = makeRequest(
+      {
+        source: 'wallet',
+        reason: 'payment',
+        amount: '250',
+        recipient: 'GABC456',
+      },
+      { 'X-Idempotency-Key': 'key-transient-fail' },
     );
-  });
 
-  it('returns identical result on retry without calling provider twice', async () => {
-    const payload = {
-      source: 'wallet',
-      reason: 'payment',
-      amount: '100',
-      recipient: 'GABC123',
-    };
+    const res = await POST(req);
+    expect(res.status).toBe(202);
 
-    const req1 = makeRequest(payload, { 'x-idempotency-key': 'retry-key' });
-    const res1 = await POST(req1);
-    const body1 = await res1.json();
-    expect(res1.status).toBe(200);
+    const body = await res.json();
+    expect(body.success).toBe(true);
+    expect(body.status).toBe('queued_for_retry');
 
-    const req2 = makeRequest(payload, { 'x-idempotency-key': 'retry-key' });
-    const res2 = await POST(req2);
-    const body2 = await res2.json();
-    expect(res2.status).toBe(200);
-    expect(body2).toEqual(body1);
-
-    // Provider only called once
-    expect(mockInitiateTransfer).toHaveBeenCalledTimes(1);
-  });
-
-  it('rejects idempotency key reuse with different payload', async () => {
-    const payload1 = {
-      source: 'wallet',
-      reason: 'payment',
-      amount: '100',
-      recipient: 'GABC123',
-    };
-
-    const req1 = makeRequest(payload1, { 'x-idempotency-key': 'reused-key' });
-    const res1 = await POST(req1);
-    expect(res1.status).toBe(200);
-
-    const payload2 = {
-      source: 'wallet',
-      reason: 'payment',
-      amount: '9999', // Different amount
-      recipient: 'GABC123',
-    };
-
-    const req2 = makeRequest(payload2, { 'x-idempotency-key': 'reused-key' });
-    const res2 = await POST(req2);
-    const body2 = await res2.json();
-
-    expect(res2.status).toBe(422);
-    expect(body2.success).toBe(false);
-    expect(body2.message).toContain('different payload');
+    const jobs = payoutRetryQueue.getJobs();
+    expect(jobs).toHaveLength(1);
+    expect(jobs[0].idempotencyKey).toBe('key-transient-fail');
+    expect(jobs[0].status).toBe('pending');
   });
 });

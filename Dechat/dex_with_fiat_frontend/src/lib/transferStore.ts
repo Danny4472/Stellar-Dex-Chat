@@ -66,21 +66,17 @@ export interface TransferStatusRecord {
   amount: number;
   failureReason?: string;
   updatedAt: string;
+  updatedAtMs?: number;
   clientSessionId?: string;
-  providerReference?: string;
-  history?: PayoutTransitionRecord[];
-}
-
-export interface TransitionPayoutParams {
-  reference: string;
-  targetStatus: PayoutStatus;
-  actor: PayoutActor | string;
-  providerReference?: string;
-  reason?: string;
-  amount?: number;
-  clientSessionId?: string;
-  failureReason?: string;
-  timestamp?: string;
+  reconciliationAttempts?: number;
+  lastReconciledAt?: string;
+  lastReconciliationResult?:
+    | 'transitioned'
+    | 'no_change'
+    | 'provider_unavailable'
+    | 'invalid_transition'
+    | 'error';
+  nextRetryAt?: number;
 }
 
 // Key is the transfer reference
@@ -175,7 +171,10 @@ export function setTransferStatus(record: TransferStatusRecord): TransferStatusR
   return record;
 }
 
+export function getAllTransfers(): TransferStatusRecord[] {
+  return Array.from(transferStore.values());
+}
+
 export function clearTransferStore(): void {
   transferStore.clear();
-  replayCache.clear();
 }
