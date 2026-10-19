@@ -14,6 +14,7 @@ name: Security Audit
 # the digests and verifies the SBOM describes the exact published artifacts.
 
 on:
+  pull_request:
   schedule:
     - cron: "0 6 * * 1" # Every Monday 06:00 UTC
   workflow_dispatch:
@@ -174,7 +175,7 @@ jobs:
   open-tracking-issue:
     name: Open Tracking Issue
     runs-on: ubuntu-latest
-    needs: [contracts-audit, frontend-audit]
+    needs: [contracts-audit, frontend-audit, secret-inventory]
     if: failure()
 
     steps:
@@ -203,14 +204,15 @@ jobs:
             const issue = await github.rest.issues.create({
               owner, repo, title, labels: [label],
               body: [
-                'The weekly `security-audit.yml` workflow (`cargo deny check advisories`',
-                'and/or `pnpm audit --prod --audit-level high`) failed.',
+                'The `security-audit.yml` workflow (`cargo deny check advisories`',
+                'and/or the pnpm severity policy) failed.',
                 '',
                 `Failed run: ${runUrl}`,
                 '',
                 'Close this issue once the advisory has been triaged (ignored with a',
                 'documented reason in `Dechat/stellar-contracts/deny.toml`, or fixed by',
-                'a dependency bump).',
+                'a dependency bump). Security bumps are not auto-merged; they go through',
+                'the normal review and test gates.',
               ].join('\n'),
             });
             core.notice(`Opened tracking issue #${issue.data.number}`);
