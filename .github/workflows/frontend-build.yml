@@ -3,6 +3,8 @@ name: Frontend Build Check
 on:
   pull_request:
     branches: [main]
+  release:
+    types: [published]
 
 permissions:
   contents: read
@@ -60,3 +62,62 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY || 'PLACEHOLDER' }}
           PAYSTACK_SECRET_KEY: ${{ secrets.PAYSTACK_SECRET_KEY || 'PLACEHOLDER' }}
           PAYOUT_PROVIDER: ${{ secrets.PAYOUT_PROVIDER || 'paystack' }}
+
+      - name: Generate Node SBOM (CycloneDX)
+        run: npx --yes @cyclonedx/cyclonedx-npm --output-format json --output-file sbom-node.cdx.json
+
+      - name: Generate Rust SBOM (CycloneDX)
+        run: |
+          if [ -f Cargo.lock ]; then
+            cargo install cargo-cyclonedx --locked
+            cargo cyclonedx --format json --output-cdx
+          else
+            echo '{"bomFormat":"CycloneDX","specVersion":"1.5","version":1,"components":[],"metadata":{"component":{"type":"application","name":"rust-deps","version":"none"}},"properties":[{"name":"sbom:exception","value":"No Cargo.lock present in repository; Rust dependency inventory not applicable."}]}' > sbom-rust.cdx.json
+          fi
+
+      - name: Compute artifact digest
+        id: digest
+        run: |
+          DIGEST=$(find .next -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum | awk '{print $1}')
+          echo "digest=sha256:${DIGEST}" >> "$GITHUB_OUTPUT"
+
+      - name: Attach SBOM and provenance to release
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ARTIFACT_DIGEST: ${{ steps.digest.outputs.digest }}
+        run: |
+          cat > provenance.json <<EOF
+          {
+            "sourceRevision": "${{ github.sha }}",
+            "workflowIdentity": "${{ github.workflow_ref }}",
+            "workflowRun": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
+            "artifactDigest": "${ARTIFACT_DIGEST}",
+            "sbom": ["sbom-node.cdx.json", "sbom-rust.cdx.json"]
+          }
+          EOF
+          gh release upload "${{ github.event.release.tag_name }}" \
+            sbom-node.cdx.json sbom-rust.cdx.json provenance.json --clobber
+
+  release-validation:
+    name: Release Provenance Validation
+    needs: build
+    if: github.event_name == 'release'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Verify release assets and provenance
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ github.event.release.tag_name }}"
+          gh release download "$TAG" --pattern 'sbom-*.cdx.json' --pattern 'provenance.json' --dir verify
+          test -s verify/sbom-node.cdx.json
+          test -s verify/sbom-rust.cdx.json
+          test -s verify/provenance.json
+          grep -q '"bomFormat"' verify/sbom-node.cdx.json
+          grep -q '"bomFormat"' verify/sbom-rust.cdx.json
+          grep -q "${{ github.sha }}" verify/provenance.json
+          grep -q 'artifactDigest' verify/provenance.json
+          echo 'Release SBOM and provenance verified.'
