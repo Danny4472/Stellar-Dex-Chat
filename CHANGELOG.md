@@ -448,6 +448,7 @@ Repo Avatar
 - **build:** Make released Soroban artifacts traceable and reproducible
 - **frontend:** Allow safe inspection during outages and add transaction progress bar stories
 - **integration:** Catch integration failures across intent, signing, and payout
+- **contract:** Event schemas, resource budgets, upgrade compatibility, and adversarial fixtures
 
 ### Fixed
 
@@ -1269,6 +1270,7 @@ Repo Avatar
 - **changelog:** Update changelog [skip ci]
 - **changelog:** Update changelog [skip ci]
 - **deps-dev:** Bump @types/node from 25.9.5 to 26.6.5
+- **changelog:** Update changelog [skip ci]
 
 ### Deprecated
 
