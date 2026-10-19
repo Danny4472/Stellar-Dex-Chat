@@ -85,6 +85,8 @@ pub enum Error {
     // --- 400 series: Funds & Balances ---
     InsufficientFunds = 401,
     NoFeesToWithdraw = 402,
+    TransferFailed = 403,
+    ShortTransfer = 404,
 
     // --- 500 series: Withdrawal Queue ---
     RequestNotFound = 501,
@@ -216,6 +218,23 @@ pub struct QueuedAdminAction {
 pub struct UserDailyVolume {
     pub usd_cents: i128,
     pub window_start: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GlobalDailyVolume {
+    pub usd_cents: i128,
+    pub window_start: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeeAccounting {
+    pub fee_bps: u32,
+    pub accrued_fees: i128,
+    pub remainder: i128,
+    pub total_gross: i128,
+    pub total_net: i128,
 }
 
 #[contracttype]
@@ -753,6 +772,44 @@ pub struct NonceConsumedEvent {
 
 #[contractevent]
 #[derive(Clone, Debug)]
+pub struct TokenRegisteredEvent {
+    pub version: u32,
+    pub token: Address,
+    pub limit: i128,
+    pub decimals: u32,
+}
+
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct TokenPrecisionMigratedEvent {
+    pub version: u32,
+    pub token: Address,
+    pub decimals: u32,
+}
+
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct GlobalFiatLimitUpdatedEvent {
+    pub version: u32,
+    pub limit_usd_cents: i128,
+}
+
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct FiatWindowUpdatedEvent {
+    pub version: u32,
+    pub window_ledgers: u32,
+}
+
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct FeeBpsUpdatedEvent {
+    pub version: u32,
+    pub fee_bps: u32,
+}
+
+#[contractevent]
+#[derive(Clone, Debug)]
 pub struct OperatorPrunedEvent {
     pub version: u32,
     pub operator: Address,
@@ -1125,7 +1182,7 @@ pub enum DataKey {
     CancellationRequest(u64),
 }
 
-const ORACLE_PRICE_DECIMALS: i128 = 10_000_000;
+pub const ORACLE_PRICE_DECIMALS: i128 = 10_000_000;
 
 // ── Contract ──────────────────────────────────────────────────────────────
 /// # FiatBridge Smart Contract
@@ -1259,6 +1316,16 @@ impl FiatBridge {
         env.storage()
             .persistent()
             .set(&DataKey::TokenRegistry(token.clone()), &config);
+        if !env
+            .storage()
+            .persistent()
+            .has(&DataKey::TokenPrecision(token.clone()))
+        {
+            let decimals = 7u32;
+            env.storage()
+                .persistent()
+                .set(&DataKey::TokenPrecision(token.clone()), &decimals);
+        }
 
         env.storage().instance().set(&DataKey::SchemaVersion, &1u32);
         env.storage().instance().set(&DataKey::NextActionID, &0u64);
@@ -1495,9 +1562,23 @@ impl FiatBridge {
         let actual_price = Self::validate_fiat_limit(&env, &from, &token, amount)?;
         Self::check_slippage(&env, expected_price, actual_price, max_slippage)?;
 
-        // Transfer
+        // Transfer and verify balance deltas (Issue #25)
         let token_client = token::Client::new(&env, &token);
+        let balance_before = token_client.balance(&env.current_contract_address());
         token_client.transfer(&from, env.current_contract_address(), &amount);
+        let balance_after = token_client.balance(&env.current_contract_address());
+        let received = balance_after
+            .checked_sub(balance_before)
+            .ok_or(Error::TransferFailed)?;
+        if received < amount {
+            return Err(Error::ShortTransfer);
+        }
+        if received != amount {
+            return Err(Error::TransferFailed);
+        }
+
+        // Protocol fee calculation with remainder accumulator (Issue #24)
+        let (_fee, net_amount) = Self::compute_fee_with_remainder(&env, &token, amount)?;
 
         // State update
         let receipt_counter: u64 = env
@@ -1529,7 +1610,7 @@ impl FiatBridge {
         let receipt = Receipt {
             id: receipt_id.clone().into(),
             depositor: from.clone(),
-            amount,
+            amount: net_amount,
             ledger: env.ledger().sequence(),
             reference,
             memo_hash: memo_hash.clone(),
@@ -1550,7 +1631,7 @@ impl FiatBridge {
 
         config.total_deposited = config
             .total_deposited
-            .checked_add(amount)
+            .checked_add(net_amount)
             .ok_or(Error::Overflow)?;
         env.storage()
             .persistent()
@@ -1558,7 +1639,9 @@ impl FiatBridge {
 
         let user_key = DataKey::UserDeposited(from.clone());
         let user_total: i128 = env.storage().instance().get(&user_key).unwrap_or(0);
-        let new_user_total = user_total.checked_add(amount).ok_or(Error::InternalError)?;
+        let new_user_total = user_total
+            .checked_add(net_amount)
+            .ok_or(Error::InternalError)?;
         env.storage().instance().set(&user_key, &new_user_total);
 
         // Track large deposits for withdrawal cooldown
@@ -1744,10 +1827,26 @@ impl FiatBridge {
         Self::reject_if_denied(&env, &to)?;
 
         let client = token::Client::new(&env, &token);
-        if amount > client.balance(&env.current_contract_address()) {
+        let recipient_before = client.balance(&to);
+        let balance_before = client.balance(&env.current_contract_address());
+        if amount > balance_before {
             return Err(Error::InsufficientFunds);
         }
         client.transfer(&env.current_contract_address(), &to, &amount);
+        let balance_after = client.balance(&env.current_contract_address());
+        let recipient_after = client.balance(&to);
+        let contract_spent = balance_before
+            .checked_sub(balance_after)
+            .ok_or(Error::TransferFailed)?;
+        let recipient_received = recipient_after
+            .checked_sub(recipient_before)
+            .ok_or(Error::TransferFailed)?;
+        if recipient_received < amount || contract_spent < amount {
+            return Err(Error::ShortTransfer);
+        }
+        if recipient_received != amount || contract_spent != amount {
+            return Err(Error::TransferFailed);
+        }
 
         let mut config: TokenConfig = env
             .storage()
@@ -2069,11 +2168,27 @@ impl FiatBridge {
             nonce,
         )?;
 
+        let recipient_before = token_client.balance(&request.to);
+        let balance_before = token_client.balance(&env.current_contract_address());
         token_client.transfer(
             &env.current_contract_address(),
             &request.to,
             &execute_amount,
         );
+        let balance_after = token_client.balance(&env.current_contract_address());
+        let recipient_after = token_client.balance(&request.to);
+        let contract_spent = balance_before
+            .checked_sub(balance_after)
+            .ok_or(Error::TransferFailed)?;
+        let recipient_received = recipient_after
+            .checked_sub(recipient_before)
+            .ok_or(Error::TransferFailed)?;
+        if recipient_received < execute_amount || contract_spent < execute_amount {
+            return Err(Error::ShortTransfer);
+        }
+        if recipient_received != execute_amount || contract_spent != execute_amount {
+            return Err(Error::TransferFailed);
+        }
 
         if execute_amount == request.amount {
             Self::remove_from_withdraw_queue(&env, request_id, &request);
@@ -2854,6 +2969,301 @@ impl FiatBridge {
         Ok(())
     }
 
+    pub fn get_fiat_limit(env: Env) -> Option<i128> {
+        env.storage().instance().get(&DataKey::FiatLimit)
+    }
+
+    pub fn set_global_fiat_limit(env: Env, limit_usd_cents: i128) -> Result<(), Error> {
+        let _admin = Self::require_admin(&env)?;
+        if limit_usd_cents < 0 {
+            return Err(Error::InvalidAmount);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::GlobalFiatLimit, &limit_usd_cents);
+        GlobalFiatLimitUpdatedEvent {
+            version: EVENT_VERSION,
+            limit_usd_cents,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    pub fn get_global_fiat_limit(env: Env) -> Option<i128> {
+        env.storage().instance().get(&DataKey::GlobalFiatLimit)
+    }
+
+    pub fn set_fiat_window(env: Env, window_ledgers: u32) -> Result<(), Error> {
+        let _admin = Self::require_admin(&env)?;
+        if window_ledgers == 0 {
+            return Err(Error::InvalidAmount);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::FiatWindowLedgers, &window_ledgers);
+        FiatWindowUpdatedEvent {
+            version: EVENT_VERSION,
+            window_ledgers,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    pub fn get_fiat_window(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::FiatWindowLedgers)
+            .unwrap_or(WINDOW_LEDGERS)
+    }
+
+    pub fn get_user_fiat_volume(env: Env, user: Address) -> i128 {
+        let curr = env.ledger().sequence();
+        let window = Self::get_fiat_window(env.clone());
+        if let Some(vol) = env
+            .storage()
+            .instance()
+            .get::<_, UserDailyVolume>(&DataKey::UserDailyVolume(user))
+        {
+            if curr >= vol.window_start.saturating_add(window) {
+                0
+            } else {
+                vol.usd_cents
+            }
+        } else {
+            0
+        }
+    }
+
+    pub fn get_global_fiat_volume(env: Env) -> i128 {
+        let curr = env.ledger().sequence();
+        let window = Self::get_fiat_window(env.clone());
+        if let Some(vol) = env
+            .storage()
+            .instance()
+            .get::<_, GlobalDailyVolume>(&DataKey::GlobalDailyVolume)
+        {
+            if curr >= vol.window_start.saturating_add(window) {
+                0
+            } else {
+                vol.usd_cents
+            }
+        } else {
+            0
+        }
+    }
+
+    /// Registers an asset in the token registry with an initial deposit/withdrawal limit and validated precision.
+    ///
+    /// # Supported Stellar Token Behavior (SEP-41)
+    /// Supported assets must conform to the standard SEP-41 token interface.
+    /// The token precision `decimals` must be within the supported bounds `[0, 18]`.
+    /// Once registered, precision cannot be modified after token use to prevent silent rate distortion.
+    pub fn register_token(
+        env: Env,
+        token: Address,
+        limit: i128,
+        decimals: u32,
+    ) -> Result<(), Error> {
+        let _admin = Self::require_admin(&env)?;
+        if limit <= 0 || limit == i128::MAX {
+            return Err(Error::InvalidAmount);
+        }
+        if decimals > 18 {
+            return Err(Error::InvalidAmount);
+        }
+
+        let reg_key = DataKey::TokenRegistry(token.clone());
+        if let Some(existing) = env.storage().persistent().get::<_, TokenConfig>(&reg_key) {
+            if existing.total_deposited > 0 || existing.total_withdrawn > 0 {
+                return Err(Error::AlreadyInitialized);
+            }
+        }
+
+        // Validate SEP-41 token interface by querying balance
+        let token_client = token::Client::new(&env, &token);
+        let _ = token_client.balance(&env.current_contract_address());
+
+        let config = TokenConfig {
+            limit,
+            daily_deposit_limit: 0,
+            total_deposited: 0,
+            total_withdrawn: 0,
+            total_liabilities: 0,
+        };
+        env.storage().persistent().set(&reg_key, &config);
+        env.storage()
+            .persistent()
+            .set(&DataKey::TokenPrecision(token.clone()), &decimals);
+
+        TokenRegisteredEvent {
+            version: EVENT_VERSION,
+            token,
+            limit,
+            decimals,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Migrates or sets the precision for an existing registered token whose precision was unknown.
+    /// Rejects if precision is invalid (> 18) or if already locked and used.
+    pub fn migrate_token_precision(env: Env, token: Address, decimals: u32) -> Result<(), Error> {
+        let _admin = Self::require_admin(&env)?;
+        if decimals > 18 {
+            return Err(Error::InvalidAmount);
+        }
+        let reg_key = DataKey::TokenRegistry(token.clone());
+        let config: TokenConfig = env
+            .storage()
+            .persistent()
+            .get(&reg_key)
+            .ok_or(Error::TokenNotWhitelisted)?;
+
+        let prec_key = DataKey::TokenPrecision(token.clone());
+        if env.storage().persistent().has(&prec_key)
+            && (config.total_deposited > 0 || config.total_withdrawn > 0)
+        {
+            return Err(Error::MigrationAlreadyComplete);
+        }
+
+        env.storage().persistent().set(&prec_key, &decimals);
+
+        TokenPrecisionMigratedEvent {
+            version: EVENT_VERSION,
+            token,
+            decimals,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    pub fn get_token_precision(env: Env, token: Address) -> u32 {
+        Self::get_token_precision_internal(&env, &token)
+    }
+
+    fn get_token_precision_internal(env: &Env, token: &Address) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::TokenPrecision(token.clone()))
+            .unwrap_or(7)
+    }
+
+    pub fn set_fee_bps(env: Env, bps: u32) -> Result<(), Error> {
+        let _admin = Self::require_admin(&env)?;
+        if bps > 10_000 {
+            return Err(Error::ExceedsLimit);
+        }
+        env.storage().instance().set(&DataKey::FeeBps, &bps);
+        FeeBpsUpdatedEvent {
+            version: EVENT_VERSION,
+            fee_bps: bps,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    pub fn get_fee_bps(env: Env) -> u32 {
+        env.storage().instance().get(&DataKey::FeeBps).unwrap_or(0)
+    }
+
+    pub fn get_fee_remainder(env: Env, token: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::FeeRemainder(token))
+            .unwrap_or(0)
+    }
+
+    pub fn get_fee_accounting(env: Env, token: Address) -> FeeAccounting {
+        let fee_bps = Self::get_fee_bps(env.clone());
+        let accrued_fees = Self::get_accrued_fees(env.clone(), token.clone());
+        let remainder = Self::get_fee_remainder(env.clone(), token.clone());
+        let total_gross: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::FeeGrossDeposited(token.clone()))
+            .unwrap_or(0);
+        let total_net: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::FeeNetDeposited(token))
+            .unwrap_or(0);
+
+        FeeAccounting {
+            fee_bps,
+            accrued_fees,
+            remainder,
+            total_gross,
+            total_net,
+        }
+    }
+
+    pub fn compute_fee_with_remainder(
+        env: &Env,
+        token: &Address,
+        gross_amount: i128,
+    ) -> Result<(i128, i128), Error> {
+        let fee_bps: u32 = env.storage().instance().get(&DataKey::FeeBps).unwrap_or(0);
+        if fee_bps == 0 {
+            let gross_key = DataKey::FeeGrossDeposited(token.clone());
+            let cur_gross: i128 = env.storage().persistent().get(&gross_key).unwrap_or(0);
+            env.storage()
+                .persistent()
+                .set(&gross_key, &(cur_gross.saturating_add(gross_amount)));
+
+            let net_key = DataKey::FeeNetDeposited(token.clone());
+            let cur_net: i128 = env.storage().persistent().get(&net_key).unwrap_or(0);
+            env.storage()
+                .persistent()
+                .set(&net_key, &(cur_net.saturating_add(gross_amount)));
+
+            return Ok((0, gross_amount));
+        }
+
+        let rem_key = DataKey::FeeRemainder(token.clone());
+        let current_rem: i128 = env.storage().persistent().get(&rem_key).unwrap_or(0);
+
+        let product = gross_amount
+            .checked_mul(fee_bps as i128)
+            .ok_or(Error::Overflow)?;
+        let total_num = product.checked_add(current_rem).ok_or(Error::Overflow)?;
+
+        let fee = total_num / 10_000;
+        let new_rem = total_num % 10_000;
+        let net = gross_amount.checked_sub(fee).ok_or(Error::Overflow)?;
+
+        env.storage().persistent().set(&rem_key, &new_rem);
+
+        if fee > 0 {
+            let vault_key = DataKey::FeeVault(token.clone());
+            let current_vault: i128 = env.storage().persistent().get(&vault_key).unwrap_or(0);
+            let new_vault = current_vault.checked_add(fee).ok_or(Error::Overflow)?;
+            env.storage().persistent().set(&vault_key, &new_vault);
+
+            FeeAccruedEvent {
+                version: EVENT_VERSION,
+                token: token.clone(),
+                amount: fee,
+            }
+            .publish(env);
+        }
+
+        let gross_key = DataKey::FeeGrossDeposited(token.clone());
+        let cur_gross: i128 = env.storage().persistent().get(&gross_key).unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&gross_key, &(cur_gross.saturating_add(gross_amount)));
+
+        let net_key = DataKey::FeeNetDeposited(token.clone());
+        let cur_net: i128 = env.storage().persistent().get(&net_key).unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&net_key, &(cur_net.saturating_add(net)));
+
+        Ok((fee, net))
+    }
+
     /// Validates execution price against expected benchmark using integer cross-multiplication.
     ///
     /// # Overflow Prevention & Mathematical Analysis
@@ -2973,9 +3383,16 @@ impl FiatBridge {
         token: &Address,
         amount: i128,
     ) -> Result<i128, Error> {
-        let fiat_limit = env.storage().instance().get::<_, i128>(&DataKey::FiatLimit);
+        let user_fiat_limit = env.storage().instance().get::<_, i128>(&DataKey::FiatLimit);
+        let global_fiat_limit = env
+            .storage()
+            .instance()
+            .get::<_, i128>(&DataKey::GlobalFiatLimit);
 
-        if fiat_limit.is_none() || fiat_limit == Some(0) {
+        let user_active = user_fiat_limit.is_some() && user_fiat_limit != Some(0);
+        let global_active = global_fiat_limit.is_some() && global_fiat_limit != Some(0);
+
+        if !user_active && !global_active {
             return Ok(0);
         }
 
@@ -3007,17 +3424,60 @@ impl FiatBridge {
                     window_start: curr,
                 });
 
-            if curr >= vol.window_start + WINDOW_LEDGERS {
-                vol.usd_cents = 0;
-                vol.window_start = curr;
+                if curr >= vol.window_start.saturating_add(window_ledgers) {
+                    vol.usd_cents = 0;
+                    vol.window_start = curr;
+                }
+                if vol
+                    .usd_cents
+                    .checked_add(usd_cents)
+                    .ok_or(Error::Overflow)?
+                    > limit
+                {
+                    return Err(Error::ExceedsFiatLimit);
+                }
+                vol.usd_cents = vol
+                    .usd_cents
+                    .checked_add(usd_cents)
+                    .ok_or(Error::Overflow)?;
+                env.storage()
+                    .instance()
+                    .set(&DataKey::UserDailyVolume(depositor.clone()), &vol);
             }
-            if vol.usd_cents + usd_cents > limit {
-                return Err(Error::ExceedsFiatLimit);
+        }
+
+        // Check and accumulate global volume cap
+        if let Some(global_limit) = global_fiat_limit {
+            if global_limit > 0 {
+                let mut global_vol: GlobalDailyVolume = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::GlobalDailyVolume)
+                    .unwrap_or(GlobalDailyVolume {
+                        usd_cents: 0,
+                        window_start: curr,
+                    });
+
+                if curr >= global_vol.window_start.saturating_add(window_ledgers) {
+                    global_vol.usd_cents = 0;
+                    global_vol.window_start = curr;
+                }
+                if global_vol
+                    .usd_cents
+                    .checked_add(usd_cents)
+                    .ok_or(Error::Overflow)?
+                    > global_limit
+                {
+                    return Err(Error::ExceedsFiatLimit);
+                }
+                global_vol.usd_cents = global_vol
+                    .usd_cents
+                    .checked_add(usd_cents)
+                    .ok_or(Error::Overflow)?;
+                env.storage()
+                    .instance()
+                    .set(&DataKey::GlobalDailyVolume, &global_vol);
             }
-            vol.usd_cents += usd_cents;
-            env.storage()
-                .instance()
-                .set(&DataKey::UserDailyVolume(depositor.clone()), &vol);
         }
 
         Ok(price)
@@ -4019,7 +4479,23 @@ impl FiatBridge {
             .publish(&env);
         }
 
+        let recipient_before = token_client.balance(&recipient);
+        let balance_before = token_client.balance(&env.current_contract_address());
         token_client.transfer(&env.current_contract_address(), &recipient, &amount);
+        let balance_after = token_client.balance(&env.current_contract_address());
+        let recipient_after = token_client.balance(&recipient);
+        let contract_spent = balance_before
+            .checked_sub(balance_after)
+            .ok_or(Error::TransferFailed)?;
+        let recipient_received = recipient_after
+            .checked_sub(recipient_before)
+            .ok_or(Error::TransferFailed)?;
+        if recipient_received < amount || contract_spent < amount {
+            return Err(Error::ShortTransfer);
+        }
+        if recipient_received != amount || contract_spent != amount {
+            return Err(Error::TransferFailed);
+        }
 
         env.storage().persistent().set(&key, &(current - amount));
         // Commit the nonce advance now that every failure path has passed.
@@ -4077,7 +4553,23 @@ impl FiatBridge {
             }
 
             let token_client = token::Client::new(&env, &token);
+            let recipient_before = token_client.balance(&recipient);
+            let balance_before = token_client.balance(&contract);
             token_client.transfer(&contract, &recipient, &current);
+            let balance_after = token_client.balance(&contract);
+            let recipient_after = token_client.balance(&recipient);
+            let contract_spent = balance_before
+                .checked_sub(balance_after)
+                .ok_or(Error::TransferFailed)?;
+            let recipient_received = recipient_after
+                .checked_sub(recipient_before)
+                .ok_or(Error::TransferFailed)?;
+            if recipient_received < current || contract_spent < current {
+                return Err(Error::ShortTransfer);
+            }
+            if recipient_received != current || contract_spent != current {
+                return Err(Error::TransferFailed);
+            }
             env.storage().persistent().set(&key, &0i128);
             FeeWithdrawnEvent {
                 version: EVENT_VERSION,
