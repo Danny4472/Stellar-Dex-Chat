@@ -429,6 +429,7 @@ Repo Avatar
 - **frontend:** Add CSP and security headers in next.config.ts
 - **contract:** Include caller and ledger in deposit, withdraw, set_limit, set_operator events
 - **frontend:** Add dynamic theme tokens to NotificationsCenter.tsx
+- **contract:** Rolling fiat caps, fee accrual conservation, token precision, and transfer validation (#23, #24, #25, #26)
 - **governance:** Clarify change scoping, required evidence, and payout exception audits
 - **api:** Payout cancellation saga, abuse controls, versioned errors, and strict bank schemas
 - **frontend:** Implement typed contract client, withdrawal queue status, paginated history, and form protection
@@ -1266,6 +1267,8 @@ Repo Avatar
 - **deps-dev:** Bump @types/node from 25.9.5 to 26.6.5
 - **changelog:** Update changelog [skip ci]
 - **changelog:** Update changelog [skip ci]
+- **changelog:** Update changelog [skip ci]
+- **deps-dev:** Bump @types/node from 25.9.5 to 26.6.5
 
 ### Deprecated
 
