@@ -27,15 +27,29 @@ export interface InitiateTransferInput {
   amount: number;
   recipient: string;
   reference?: string;
+  credentialVersion?: string;
 }
 
 export type InitiateTransferResult = Record<string, unknown>;
 
 export interface TransferStatusInput {
   reference: string;
+  credentialVersion?: string;
 }
 
 export type TransferStatusResult = Record<string, unknown>;
+
+export interface CancelTransferInput {
+  reference: string;
+  reason?: string;
+}
+
+export interface CancelTransferResult {
+  status: 'confirmed' | 'rejected' | 'pending' | 'settled';
+  cancellable: boolean;
+  message?: string;
+  providerReference?: string;
+}
 
 export interface PayoutProvider {
   name: PayoutProviderName;
@@ -48,4 +62,7 @@ export interface PayoutProvider {
   checkTransferStatus(
     input: TransferStatusInput,
   ): Promise<TransferStatusResult>;
+  cancelTransfer?(
+    input: CancelTransferInput,
+  ): Promise<CancelTransferResult>;
 }
