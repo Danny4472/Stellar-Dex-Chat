@@ -15,8 +15,11 @@ export async function POST(
   request: NextRequest,
   { params }: { params: Promise<{ reference: string }> },
 ) {
+  const correlationId = extractOrGenerateCorrelationId(request.headers);
   const ip = getClientIp(request);
-  const limited = applyRateLimit(ip, '/api/transfer-status', RATE_LIMIT);
+  const limited = applyRateLimit(ip, '/api/transfer-status', RATE_LIMIT, {
+    correlationId,
+  });
   if (limited) return limited;
 
   try {
@@ -24,10 +27,11 @@ export async function POST(
     const { reference } = p;
 
     if (!reference) {
-      return NextResponse.json(
-        { success: false, message: 'Reference is required' },
-        { status: 400 },
-      );
+      return validationError({
+        message: 'Reference is required',
+        correlationId,
+        issues: [{ path: ['reference'], message: 'Reference is required' }],
+      });
     }
 
     const body = await request.json().catch(() => ({}));
@@ -61,20 +65,52 @@ export async function POST(
       reconciled: existing?.reconciled,
     });
 
-    return NextResponse.json({
-      success: true,
-      data: {
-        reference,
-        status: 'cancelled',
-        message: 'Transfer cancellation requested successfully',
+    if (!sagaResult.success) {
+      if (sagaResult.status === 403) {
+        return authorizationError({
+          status: 403,
+          message: sagaResult.message,
+          correlationId,
+        });
+      }
+
+      return createPayoutErrorResponse({
+        status: sagaResult.status,
+        code: (sagaResult.code as any) || 'CANCELLATION_REJECTED',
+        userMessage: sagaResult.message,
+        category:
+          sagaResult.status === 404
+            ? 'validation'
+            : sagaResult.status === 403
+              ? 'authorization'
+              : 'provider',
+        retryable: false,
+        correlationId,
+      });
+    }
+
+    const response = NextResponse.json(
+      {
+        success: true,
+        data: sagaResult.data || {
+          reference,
+          status: sagaResult.outcome === 'provider_confirmed' ? 'cancelled' : 'pending',
+          outcome: sagaResult.outcome,
+          message: sagaResult.message,
+        },
       },
-    });
+      { status: sagaResult.status },
+    );
+
+    response.headers.set('X-Correlation-Id', correlationId);
+    return response;
   } catch (error: unknown) {
     console.error('Cancel transfer error:', error);
-    return NextResponse.json(
-      { success: false, message: 'Failed to cancel transfer' },
-      { status: 500 },
-    );
+    return internalError({
+      error,
+      correlationId,
+      message: 'Failed to cancel transfer',
+    });
   }
 }
 
@@ -82,6 +118,8 @@ export async function GET(
   request: NextRequest,
   { params }: { params: Promise<{ reference: string }> },
 ) {
+  const correlationId = extractOrGenerateCorrelationId(request.headers);
+
   try {
     const p = await params;
     const { reference } = p;
@@ -118,11 +156,14 @@ export async function GET(
       success: true,
       data: transferRecord,
     });
+    response.headers.set('X-Correlation-Id', correlationId);
+    return response;
   } catch (error: unknown) {
     console.error('Get transfer status error:', error);
-    return NextResponse.json(
-      { success: false, message: 'Failed to retrieve transfer status' },
-      { status: 500 },
-    );
+    return internalError({
+      error,
+      correlationId,
+      message: 'Failed to retrieve transfer status',
+    });
   }
 }

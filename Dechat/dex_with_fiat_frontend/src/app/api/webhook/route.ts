@@ -67,6 +67,15 @@ export async function POST(request: NextRequest) {
     });
 
     if (!signature) {
+      // Apply abuse controls to unverified requests
+      const ip = getClientIp(request);
+      const limited = applyRateLimit(
+        ip,
+        '/api/webhook',
+        ROUTE_COST_BUCKETS['/api/webhook'] ?? { maxRequests: 20, windowMs: 60_000 },
+      );
+      if (limited) return limited;
+
       telemetry.addLog(span.spanId, 'warn', 'No signature provided', {
         endpoint: '/api/webhook',
       });
@@ -124,6 +133,7 @@ export async function POST(request: NextRequest) {
         { status: 401 },
       );
     }
+    // Signature verified: request is recognized as a trusted provider callback and excluded from rate limiting
 
     telemetry.addLog(span.spanId, 'info', 'Webhook signature verified', {
       endpoint: '/api/webhook',

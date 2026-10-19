@@ -37,6 +37,7 @@ export async function POST(request: NextRequest) {
   if (securityBlocked) return securityBlocked;
 
   const ip = getClientIp(request);
+
   const limited = applyRateLimit(ip, '/api/initiate-transfer', RATE_LIMIT);
   if (limited) return limited;
 
@@ -50,43 +51,46 @@ export async function POST(request: NextRequest) {
   try {
     telemetry.addLog(span.spanId, 'info', 'Starting transfer initiation', {
       endpoint: '/api/initiate-transfer',
+      correlationId,
     });
 
     let body: unknown;
     try {
       body = await request.json();
     } catch {
-      telemetry.addLog(span.spanId, 'warn', 'Malformed JSON body');
+      telemetry.addLog(span.spanId, 'warn', 'Malformed JSON body', {
+        correlationId,
+      });
       telemetry.finishSpan(span.spanId, {
         success: false,
         error: 'Invalid JSON body',
       });
-      return NextResponse.json(
-        { success: false, message: 'Invalid JSON in request body.' },
-        { status: 400 },
-      );
+
+      return validationError({
+        message: 'Invalid JSON in request body.',
+        correlationId,
+        code: 'MALFORMED_REQUEST',
+      });
     }
 
-    // Validate with Zod
+    // Validate with strict Zod schema
     const validationResult = initiateTransferSchema.safeParse(body);
 
     if (!validationResult.success) {
       telemetry.addLog(span.spanId, 'warn', 'Zod validation failed', {
         errors: validationResult.error.issues,
+        correlationId,
       });
       telemetry.finishSpan(span.spanId, {
         success: false,
         error: 'Validation failed',
       });
 
-      return NextResponse.json(
-        {
-          success: false,
-          message: 'Validation failed',
-          errors: validationResult.error.issues,
-        },
-        { status: 400 },
-      );
+      return validationError({
+        message: 'Validation failed',
+        correlationId,
+        issues: validationResult.error.issues,
+      });
     }
 
     const { source, reason, amount, recipient } = validationResult.data;
@@ -235,13 +239,20 @@ export async function POST(request: NextRequest) {
       );
     }
   } catch (error: unknown) {
+    logStructuredError('initiate-transfer', error, {
+      endpoint: '/api/initiate-transfer',
+      correlationId,
+      ip: getClientIp(request),
+    });
+
     Sentry.captureException(error, {
       tags: {
         endpoint: '/api/initiate-transfer',
         operation: 'transfer_initiation',
       },
       extra: {
-        ip,
+        ip: getClientIp(request),
+        correlationId,
         traceId: traceContext.traceId,
         spanId: span.spanId,
       },

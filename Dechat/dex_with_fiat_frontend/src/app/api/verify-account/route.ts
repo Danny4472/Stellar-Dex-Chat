@@ -24,6 +24,7 @@ export async function POST(request: NextRequest) {
   if (securityBlocked) return securityBlocked;
 
   const ip = getClientIp(request);
+
   const limited = applyRateLimit(ip, '/api/verify-account', RATE_LIMIT);
   if (limited) return limited;
 
@@ -37,6 +38,7 @@ export async function POST(request: NextRequest) {
   try {
     telemetry.addLog(span.spanId, 'info', 'Starting account verification', {
       endpoint: '/api/verify-account',
+      correlationId,
     });
 
     let body: unknown;
@@ -45,37 +47,38 @@ export async function POST(request: NextRequest) {
     } catch {
       telemetry.addLog(span.spanId, 'warn', 'Request body is not valid JSON', {
         endpoint: '/api/verify-account',
+        correlationId,
       });
       telemetry.finishSpan(span.spanId, {
         success: false,
         error: 'Invalid JSON body',
       });
-      return NextResponse.json(
-        { success: false, message: 'Request body must be valid JSON' },
-        { status: 400 },
-      );
+
+      return validationError({
+        message: 'Request body must be valid JSON',
+        correlationId,
+        code: 'MALFORMED_REQUEST',
+      });
     }
 
-    // Validate with Zod
+    // Validate with strict server-side Zod schema
     const validationResult = verifyAccountSchema.safeParse(body);
 
     if (!validationResult.success) {
       telemetry.addLog(span.spanId, 'warn', 'Zod validation failed', {
         errors: validationResult.error.issues,
+        correlationId,
       });
       telemetry.finishSpan(span.spanId, {
         success: false,
         error: 'Validation failed',
       });
 
-      return NextResponse.json(
-        {
-          success: false,
-          message: 'Validation failed',
-          errors: validationResult.error.issues,
-        },
-        { status: 400 },
-      );
+      return validationError({
+        message: 'Validation failed',
+        correlationId,
+        issues: validationResult.error.issues,
+      });
     }
 
     const { accountNumber, bankCode } = validationResult.data;
@@ -84,6 +87,7 @@ export async function POST(request: NextRequest) {
       hasAccountNumber: !!accountNumber,
       hasBankCode: !!bankCode,
       bankCode: bankCode,
+      correlationId,
     });
 
     const provider = getPayoutProvider();
@@ -96,15 +100,23 @@ export async function POST(request: NextRequest) {
     telemetry.finishSpan(span.spanId, { success: true });
 
     const apiResponse = NextResponse.json({ success: true, data });
+    apiResponse.headers.set('X-Correlation-Id', correlationId);
     telemetry.setTraceHeaders(apiResponse.headers, traceContext);
     return apiResponse;
   } catch (error: unknown) {
+    logStructuredError('verify-account', error, {
+      endpoint: '/api/verify-account',
+      correlationId,
+      ip: getClientIp(request),
+    });
+
     telemetry.addLog(
       span.spanId,
       'error',
       'Unhandled error in account verification',
       {
         error: error instanceof Error ? error.message : 'Unknown error',
+        correlationId,
       },
     );
 

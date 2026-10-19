@@ -25,6 +25,7 @@ export async function POST(request: NextRequest) {
   if (securityBlocked) return securityBlocked;
 
   const ip = getClientIp(request);
+
   const limited = applyRateLimit(ip, '/api/create-recipient', RATE_LIMIT);
   if (limited) return limited;
 
@@ -38,55 +39,56 @@ export async function POST(request: NextRequest) {
   try {
     telemetry.addLog(span.spanId, 'info', 'Starting recipient creation', {
       endpoint: '/api/create-recipient',
+      correlationId,
     });
 
     let body: unknown;
     try {
       body = await request.json();
     } catch {
-      telemetry.addLog(span.spanId, 'warn', 'Malformed JSON body');
+      telemetry.addLog(span.spanId, 'warn', 'Malformed JSON body', {
+        correlationId,
+      });
       telemetry.finishSpan(span.spanId, {
         success: false,
         error: 'Invalid JSON body',
       });
-      return NextResponse.json(
-        { success: false, message: 'Invalid JSON in request body.' },
-        { status: 400 },
-      );
+
+      return validationError({
+        message: 'Invalid JSON in request body.',
+        correlationId,
+        code: 'MALFORMED_REQUEST',
+      });
     }
 
-    // Validate with Zod
+    // Validate with strict server-side Zod schema
     const validationResult = createRecipientSchema.safeParse(body);
 
     if (!validationResult.success) {
       telemetry.addLog(span.spanId, 'warn', 'Zod validation failed', {
         errors: validationResult.error.issues,
+        correlationId,
       });
       telemetry.finishSpan(span.spanId, {
         success: false,
         error: 'Validation failed',
       });
 
-      return NextResponse.json(
-        {
-          success: false,
-          message: 'Validation failed',
-          errors: validationResult.error.issues,
-        },
-        { status: 400 },
-      );
+      return validationError({
+        message: 'Validation failed',
+        correlationId,
+        issues: validationResult.error.issues,
+      });
     }
 
-    const { type, name, account_number, bank_code, currency } =
+    const { type, name, account_number, bank_code, currency, description } =
       validationResult.data;
 
     telemetry.addLog(span.spanId, 'info', 'Request validated', {
       hasType: !!type,
       hasName: !!name,
-      hasAccountNumber: !!account_number,
-      hasBankCode: !!bank_code,
-      hasCurrency: !!currency,
-      currency: currency,
+      currency,
+      correlationId,
     });
 
     const userScope =
@@ -140,6 +142,7 @@ export async function POST(request: NextRequest) {
       'Unhandled error in recipient creation',
       {
         error: error instanceof Error ? error.message : 'Unknown error',
+        correlationId,
       },
     );
 
