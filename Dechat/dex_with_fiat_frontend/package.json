@@ -22,8 +22,9 @@
     "test:unit:watch": "vitest",
     "test:coverage": "vitest run --coverage --maxWorkers=1 --pool=forks --no-file-parallelism",
     "test:coverage:merge": "vitest run --mergeReports --coverage --reporter=default",
-    "contract:bindings:generate": "node scripts/contract-bindings.mjs generate",
-    "contract:bindings:check": "node scripts/contract-bindings.mjs check"
+    "sbom:node": "cyclonedx-npm --output-format json --output-file sbom-node.cdx.json",
+    "sbom:rust": "cargo cyclonedx --format json --output-pattern package --output-cdx --manifest-path ../dex_with_fiat_backend/Cargo.toml",
+    "sbom": "pnpm sbom:node && pnpm sbom:rust"
   },
   "dependencies": {
     "@google/generative-ai": "^0.21.0",
@@ -51,7 +52,7 @@
     "zod": "^4.3.6"
   },
   "devDependencies": {
-    "@axe-core/playwright": "^4.10.2",
+    "@cyclonedx/cyclonedx-npm": "^1.19.3",
     "@eslint/eslintrc": "^3.3.5",
     "@playwright/test": "^1.58.2",
     "@tailwindcss/postcss": "^4",

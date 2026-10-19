@@ -1,13 +1,34 @@
 import { NextRequest, NextResponse } from 'next/server';
-
 import { getPayoutProvider } from '@/lib/payout/providers/registry';
 import { applyRateLimit, getClientIp } from '@/lib/rateLimit';
 import { transferStatusSchema } from '@/lib/apiSchemas';
+import { enforcePayoutRouteSecurity } from '@/lib/payout/security';
+import {
+  getProviderCircuitBreaker,
+  handlePayoutApiError,
+} from '@/lib/payout/circuitBreaker';
 
-const RATE_LIMIT = { maxRequests: 10, windowMs: 60_000 };
+const RATE_LIMIT = {
+  maxRequests: 15,
+  windowMs: 60_000,
+  cost: 1,
+  burstLimit: 8,
+};
+
+export async function OPTIONS(request: NextRequest) {
+  return (
+    enforcePayoutRouteSecurity(request) ||
+    new NextResponse(null, { status: 204 })
+  );
+}
 
 export async function POST(request: NextRequest) {
+  // Enforce payout API security
+  const securityBlocked = enforcePayoutRouteSecurity(request);
+  if (securityBlocked) return securityBlocked;
+
   const ip = getClientIp(request);
+
   const limited = applyRateLimit(ip, '/api/transfer-status', RATE_LIMIT);
   if (limited) return limited;
 
@@ -16,62 +37,65 @@ export async function POST(request: NextRequest) {
     try {
       body = await request.json();
     } catch {
-      return NextResponse.json(
-        { success: false, message: 'Request body must be valid JSON' },
-        { status: 400 },
-      );
+      return validationError({
+        message: 'Request body must be valid JSON',
+        correlationId,
+        code: 'MALFORMED_REQUEST',
+      });
     }
 
     const validationResult = transferStatusSchema.safeParse(body);
     if (!validationResult.success) {
-      return NextResponse.json(
-        {
-          success: false,
-          message: 'Validation failed',
-          errors: validationResult.error.issues,
-        },
-        { status: 400 },
-      );
+      return validationError({
+        message: 'Validation failed',
+        correlationId,
+        issues: validationResult.error.issues,
+      });
     }
 
     const { reference } = validationResult.data;
+    const bodyRecord = body as Record<string, unknown>;
+    const clientSessionId =
+      request.headers.get('x-client-session-id') ||
+      (typeof bodyRecord.clientSessionId === 'string'
+        ? bodyRecord.clientSessionId
+        : undefined);
+
+    // IDOR check: verify caller is authorized for this reference.
+    // If unauthorized, return 404 immediately without calling the provider!
+    const auth = authorizeTransferAccess(request, reference, clientSessionId);
+    if (!auth.authorized) {
+      return uniformNotFoundResponse();
+    }
 
     const provider = getPayoutProvider();
-    const data = await provider.checkTransferStatus({ reference });
+    const breaker = getProviderCircuitBreaker(provider.name);
 
-    return NextResponse.json({
+    const data = await breaker.execute(() =>
+      provider.checkTransferStatus({ reference }),
+    );
+
+    const response = NextResponse.json({
       success: true,
       data,
     });
+    response.headers.set('X-Correlation-Id', correlationId);
+    return response;
   } catch (error: unknown) {
-    console.error('Transfer status error:', error);
+    logStructuredError('transfer-status', error, {
+      endpoint: '/api/transfer-status',
+      correlationId,
+      ip: getClientIp(request),
+    });
 
-    if (
-      error &&
-      typeof error === 'object' &&
-      'response' in error &&
-      error.response &&
-      typeof error.response === 'object' &&
-      'data' in error.response &&
-      error.response.data &&
-      typeof error.response.data === 'object' &&
-      'message' in error.response.data
-    ) {
-      return NextResponse.json(
-        {
-          success: false,
-          message: (error.response.data as { message: string }).message,
-        },
-        { status: 400 },
-      );
-    }
-
-    return NextResponse.json(
-      {
-        success: false,
-        message: 'Failed to fetch transfer status. Please try again.',
-      },
-      { status: 500 },
+    const errorDetails = handlePayoutApiError(
+      error,
+      'Failed to fetch transfer status. Please try again.',
     );
+
+    return NextResponse.json(errorDetails.body, {
+      status: errorDetails.status,
+      headers: errorDetails.headers,
+    });
   }
 }

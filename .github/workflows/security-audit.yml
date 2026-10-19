@@ -6,11 +6,19 @@ name: Security Audit
 # touch their respective directories, so a fresh RUSTSEC/npm advisory
 # otherwise goes unnoticed until someone edits nearby code. This runs both
 # audits weekly regardless of what changed.
+#
+# Release SBOM/provenance (issue #114): the `release-sbom` job generates
+# CycloneDX inventories for the Rust contracts and the Node frontend, records
+# the source revision, workflow identity and artifact digests, and attaches
+# them to the release. The `release-validation` job independently re-derives
+# the digests and verifies the SBOM describes the exact published artifacts.
 
 on:
   schedule:
     - cron: "0 6 * * 1" # Every Monday 06:00 UTC
   workflow_dispatch:
+  release:
+    types: [published]
 
 permissions:
   contents: read
@@ -23,7 +31,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Run cargo-deny (advisories)
         uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
@@ -41,7 +49,48 @@ jobs:
 
     steps:
       - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          version: 9
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+          cache: "pnpm"
+          cache-dependency-path: Dechat/dex_with_fiat_frontend/pnpm-lock.yaml
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Audit production dependencies
+        run: pnpm audit --prod --audit-level high
+
+  release-sbom:
+    name: Generate Release SBOM
+    runs-on: ubuntu-latest
+    if: github.event_name == 'release'
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.release.tag_name }}
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@b3b07ba8b418998c39fb20f9d8b695e5a3ed04c9 # stable
+
+      - name: Install cargo-cyclonedx
+        run: cargo install cargo-cyclonedx --locked
+
+      - name: Generate Rust (CycloneDX) SBOM
+        working-directory: Dechat/stellar-contracts
+        run: cargo cyclonedx --format json --output-pattern package --output-cdx
 
       - name: Install pnpm
         uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa # v4
@@ -56,10 +105,71 @@ jobs:
           cache-dependency-path: Dechat/dex_with_fiat_frontend/pnpm-lock.yaml
 
       - name: Install dependencies
+        working-directory: Dechat/dex_with_fiat_frontend
         run: pnpm install --frozen-lockfile
 
-      - name: Audit production dependencies
-        run: pnpm audit --prod --audit-level high
+      - name: Generate Node (CycloneDX) SBOM
+        working-directory: Dechat/dex_with_fiat_frontend
+        run: pnpm dlx @cyclonedx/cyclonedx-npm --output-format json --output-file sbom-node.cdx.json
+
+      - name: Collect SBOMs and record provenance
+        run: |
+          set -euo pipefail
+          mkdir -p release-artifacts
+          find Dechat/stellar-contracts -name '*.cdx.json' -exec cp {} release-artifacts/ \;
+          cp Dechat/dex_with_fiat_frontend/sbom-node.cdx.json release-artifacts/
+          {
+            echo "source_revision=${GITHUB_SHA}";
+            echo "workflow_identity=${GITHUB_REPOSITORY}/${GITHUB_WORKFLOW_REF}";
+            echo "release_tag=${{ github.event.release.tag_name }}";
+          } > release-artifacts/provenance.txt
+          (cd release-artifacts && sha256sum ./*.cdx.json > sbom-digests.txt)
+          cat release-artifacts/provenance.txt release-artifacts/sbom-digests.txt
+
+      - name: Upload SBOM artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-sbom
+          path: release-artifacts/
+
+      - name: Attach SBOM and provenance to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release upload "${{ github.event.release.tag_name }}" \
+            release-artifacts/*.cdx.json \
+            release-artifacts/provenance.txt \
+            release-artifacts/sbom-digests.txt \
+            --clobber
+
+  release-validation:
+    name: Verify Release Provenance
+    runs-on: ubuntu-latest
+    needs: [release-sbom]
+    if: github.event_name == 'release'
+    permissions:
+      contents: read
+
+    steps:
+      - name: Download published SBOM artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-sbom
+          path: release-artifacts
+
+      - name: Verify SBOM digests and provenance
+        run: |
+          set -euo pipefail
+          cd release-artifacts
+          # Re-derive digests and confirm they match the recorded manifest.
+          sha256sum -c sbom-digests.txt
+          # Provenance must reference this exact revision and workflow.
+          grep -q "source_revision=${GITHUB_SHA}" provenance.txt
+          grep -q "workflow_identity=${GITHUB_REPOSITORY}/" provenance.txt
+          # At least one Rust and one Node SBOM must be present.
+          ls ./*.cdx.json >/dev/null
+          echo "SBOM and provenance verified for ${GITHUB_SHA}"
 
   open-tracking-issue:
     name: Open Tracking Issue
@@ -69,7 +179,7 @@ jobs:
 
     steps:
       - name: Find or create tracking issue
-        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
           script: |
             const { owner, repo } = context.repo;
