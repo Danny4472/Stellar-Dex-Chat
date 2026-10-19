@@ -915,6 +915,10 @@ Repo Avatar
 - #108 feat(ai): add locale-aware intent evaluation without changing
 - #109 feat(ai): add deterministic conversation replay for incident d
 - #110 perf(ai): add bounded timeouts and cancellation for model requ
+- #111 feat(ai): enforce per-user request quotas and model spend ceil
+- #112 security: publish a versioned threat model and abuse-case regi
+- #113 security(frontend): establish a restrictive Content Security P
+- #114 security(ci): generate and verify release SBOM and artifact pr
 
 ### Changed
 
@@ -1241,6 +1245,8 @@ Repo Avatar
 - **changelog:** Update changelog [skip ci]
 - **deps-dev:** Bump lint-staged from 16.4.0 to 17.6.0
 - **deps:** Bump the actions group with 9 updates
+- **changelog:** Update changelog [skip ci]
+- **deps-dev:** Bump @types/node from 25.9.5 to 26.6.5
 
 ### Deprecated
 
