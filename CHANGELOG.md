@@ -429,6 +429,7 @@ Repo Avatar
 - **frontend:** Add CSP and security headers in next.config.ts
 - **contract:** Include caller and ledger in deposit, withdraw, set_limit, set_operator events
 - **frontend:** Add dynamic theme tokens to NotificationsCenter.tsx
+- **governance:** Clarify change scoping, required evidence, and payout exception audits
 - **api:** Payout cancellation saga, abuse controls, versioned errors, and strict bank schemas
 - **frontend:** Implement typed contract client, withdrawal queue status, paginated history, and form protection
 - **api:** Payout timeout budgets, IDOR auth matrix, credential rotation, and sandbox lifecycle (#98, #104, #105, #106)
@@ -438,6 +439,14 @@ Repo Avatar
 - **api:** Durable webhook deduplication, out-of-order reconciliation, retry queue, and append-only audit ledger (#35, #36, #37, #38)
 - **contract:** Multisig rotation, role capabilities, bounded heartbeat, and rate limits (#19, #20, #21, #22)
 - Implement payout PII retention, simulation pre-sign review, pending tx recovery, and exact integer arithmetic (#51, #52, #53, #55)
+- **frontend:** Turn contract & wallet failures into actionable guidance
+- **ai:** Separate language understanding from transaction execution
+- **ai:** Make transaction permissions independent from prompt wording
+- **ai:** Reduce generative AI coupling and support controlled failover
+- **ai:** Add prompt data minimization and contract deployment preflight checks
+- **build:** Make released Soroban artifacts traceable and reproducible
+- **frontend:** Allow safe inspection during outages and add transaction progress bar stories
+- **integration:** Catch integration failures across intent, signing, and payout
 
 ### Fixed
 
@@ -911,6 +920,10 @@ Repo Avatar
 - **frontend:** Remove duplicate closing p tag in LandingPage
 - **frontend:** Remove unused CheckCircle import from LandingPage
 - **frontend:** Address issues 1510, 1513, 1515, 1518
+- #115 security(ci): add dependency vulnerability scanning with remed
+- #116 security: establish secret inventory, rotation cadence, and le
+- #117 security(api): add regression coverage for payout authorizatio
+- #118 security(api): encrypt sensitive payout fields with rotatable
 - #107 feat(ai): show source and timestamp for factual rate and payou
 - #108 feat(ai): add locale-aware intent evaluation without changing
 - #109 feat(ai): add deterministic conversation replay for incident d
@@ -1251,6 +1264,7 @@ Repo Avatar
 - **deps:** Bump the actions group with 9 updates
 - **changelog:** Update changelog [skip ci]
 - **deps-dev:** Bump @types/node from 25.9.5 to 26.6.5
+- **changelog:** Update changelog [skip ci]
 - **changelog:** Update changelog [skip ci]
 
 ### Deprecated
