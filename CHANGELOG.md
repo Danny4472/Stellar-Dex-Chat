@@ -429,6 +429,7 @@ Repo Avatar
 - **frontend:** Add CSP and security headers in next.config.ts
 - **contract:** Include caller and ledger in deposit, withdraw, set_limit, set_operator events
 - **frontend:** Add dynamic theme tokens to NotificationsCenter.tsx
+- **api:** Payout cancellation saga, abuse controls, versioned errors, and strict bank schemas
 - **frontend:** Implement typed contract client, withdrawal queue status, paginated history, and form protection
 - **api:** Payout timeout budgets, IDOR auth matrix, credential rotation, and sandbox lifecycle (#98, #104, #105, #106)
 - **frontend:** Implement transfer timeline, cross-tab payout coordination, session recovery, and resilient RPC
@@ -1237,6 +1238,9 @@ Repo Avatar
 - **changelog:** Update changelog [skip ci]
 - **changelog:** Update changelog [skip ci]
 - **changelog:** Update changelog [skip ci]
+- **changelog:** Update changelog [skip ci]
+- **deps-dev:** Bump lint-staged from 16.4.0 to 17.6.0
+- **deps:** Bump the actions group with 9 updates
 
 ### Deprecated
 
