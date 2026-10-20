@@ -58,11 +58,17 @@ export interface TransferStatusRecord {
   currency?: string;
   failureReason?: string;
   updatedAt: string;
+  updatedAtMs?: number;
   clientSessionId?: string;
-  ownerWallet?: string;
-  receiptId?: string;
-  withdrawalRequestId?: string;
-  providerReference?: string;
+  reconciliationAttempts?: number;
+  lastReconciledAt?: string;
+  lastReconciliationResult?:
+    | 'transitioned'
+    | 'no_change'
+    | 'provider_unavailable'
+    | 'invalid_transition'
+    | 'error';
+  nextRetryAt?: number;
 }
 
 // Key is the transfer reference
@@ -81,15 +87,10 @@ export function setTransferStatus(
   return record;
 }
 
-export function isTransferAuthorized(
-  record: TransferStatusRecord,
-  caller: {
-    type: 'wallet' | 'operator';
-    address?: string;
-    isOperator: boolean;
-  },
-): boolean {
-  if (caller.isOperator) return true;
-  if (!record.ownerWallet) return false;
-  return record.ownerWallet === caller.address;
+export function getAllTransfers(): TransferStatusRecord[] {
+  return Array.from(transferStore.values());
+}
+
+export function clearTransferStore(): void {
+  transferStore.clear();
 }

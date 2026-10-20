@@ -115,19 +115,7 @@ export interface InitiateTransferInput {
   amount: number | string;
   recipient: string;
   reference?: string;
-  currency?: string;
-  idempotencyKey?: string;
-}
-
-export interface InitiatedTransfer {
-  reference: string;
-  status: NormalizedPayoutStatus;
-  providerReference?: string;
-  transferCode?: string;
-  amountMinor: bigint;
-  currency: string;
-  recipientCode: string;
-  rawResponse?: unknown;
+  credentialVersion?: string;
 }
 
 // Backward compatibility alias
@@ -139,6 +127,7 @@ export type InitiateTransferResult = InitiatedTransfer;
 
 export interface TransferStatusInput {
   reference: string;
+  credentialVersion?: string;
 }
 
 export interface TransferStatus {
@@ -160,26 +149,30 @@ export type TransferStatusResult = TransferStatus;
 // Provider Interface
 // ==========================================
 
+export interface CancelTransferInput {
+  reference: string;
+  reason?: string;
+}
+
+export interface CancelTransferResult {
+  status: 'confirmed' | 'rejected' | 'pending' | 'settled';
+  cancellable: boolean;
+  message?: string;
+  providerReference?: string;
+}
+
 export interface PayoutProvider {
-  readonly name: PayoutProviderName;
+  name: PayoutProviderName;
 
-  /**
-   * Verifies destination bank account ownership.
-   */
-  verifyAccount(input: VerifyAccountInput): Promise<VerifiedAccount>;
-
-  /**
-   * Creates a beneficiary recipient for transfer routing.
-   */
-  createRecipient(input: CreateRecipientInput): Promise<CreatedRecipient>;
-
-  /**
-   * Initiates an off-chain payout transfer with built-in idempotency and retry policy.
-   */
-  initiateTransfer(input: InitiateTransferInput): Promise<InitiatedTransfer>;
-
-  /**
-   * Queries real-time status of a transfer by reference.
-   */
-  checkTransferStatus(input: TransferStatusInput): Promise<TransferStatus>;
+  verifyAccount(input: VerifyAccountInput): Promise<VerifyAccountResult>;
+  createRecipient(input: CreateRecipientInput): Promise<CreateRecipientResult>;
+  initiateTransfer(
+    input: InitiateTransferInput,
+  ): Promise<InitiateTransferResult>;
+  checkTransferStatus(
+    input: TransferStatusInput,
+  ): Promise<TransferStatusResult>;
+  cancelTransfer?(
+    input: CancelTransferInput,
+  ): Promise<CancelTransferResult>;
 }

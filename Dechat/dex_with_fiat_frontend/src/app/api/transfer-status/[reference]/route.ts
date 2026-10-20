@@ -1,24 +1,25 @@
 import { NextRequest, NextResponse } from 'next/server';
-import {
-  getTransferStatus,
-  isTransferAuthorized,
-  setTransferStatus,
-} from '@/lib/transferStore';
+import { setTransferStatus } from '@/lib/transferStore';
 import { applyRateLimit, getClientIp } from '@/lib/rateLimit';
 import {
-  nonEnumeratingNotFoundResponse,
-  resolveCallerIdentity,
-  unauthorizedResponse,
-} from '@/lib/payout/auth';
+  authorizeTransferAccess,
+  uniformNotFoundResponse,
+} from '@/lib/auth/authorizationMatrix';
 
 const RATE_LIMIT = { maxRequests: 5, windowMs: 60_000 };
+
+// Temporary memory store to mark cancellation requests.
+const cancelledTransfers = new Set<string>();
 
 export async function POST(
   request: NextRequest,
   { params }: { params: Promise<{ reference: string }> },
 ) {
+  const correlationId = extractOrGenerateCorrelationId(request.headers);
   const ip = getClientIp(request);
-  const limited = applyRateLimit(ip, '/api/transfer-status', RATE_LIMIT);
+  const limited = applyRateLimit(ip, '/api/transfer-status', RATE_LIMIT, {
+    correlationId,
+  });
   if (limited) return limited;
 
   try {
@@ -31,19 +32,24 @@ export async function POST(
     const { reference } = p;
 
     if (!reference) {
-      return NextResponse.json(
-        { success: false, message: 'Reference is required' },
-        { status: 400 },
-      );
+      return validationError({
+        message: 'Reference is required',
+        correlationId,
+        issues: [{ path: ['reference'], message: 'Reference is required' }],
+      });
     }
 
-    const existing = getTransferStatus(reference);
+    const body = await request.json().catch(() => ({}));
+    const clientSessionId = body.clientSessionId as string | undefined;
 
-    // Non-enumerating error: Return the exact same 404 for unknown AND unauthorized references
-    if (!existing || !isTransferAuthorized(existing, caller)) {
-      return nonEnumeratingNotFoundResponse('Transfer');
+    // IDOR check: authorize caller before performing cancellation or returning sensitive data.
+    // Denials return uniform 404 to avoid leaking record existence.
+    const auth = authorizeTransferAccess(request, reference, clientSessionId);
+    if (!auth.authorized || !auth.record) {
+      return uniformNotFoundResponse();
     }
 
+    const existing = auth.record;
     if (existing.status !== 'pending') {
       return NextResponse.json(
         { success: false, message: 'Only pending transfers can be cancelled' },
@@ -51,26 +57,64 @@ export async function POST(
       );
     }
 
-    const updated = setTransferStatus({
-      ...existing,
+    cancelledTransfers.add(reference);
+    setTransferStatus({
+      reference,
       status: 'cancelled',
       updatedAt: new Date().toISOString(),
+      clientSessionId: existing?.clientSessionId,
+      failureReason: existing?.failureReason,
+      credentialVersion: existing?.credentialVersion,
+      timeoutOutcome: existing?.timeoutOutcome,
+      reconciled: existing?.reconciled,
     });
 
-    return NextResponse.json({
-      success: true,
-      data: {
-        reference: updated.reference,
-        status: updated.status,
-        message: 'Transfer cancellation requested successfully',
+    if (!sagaResult.success) {
+      if (sagaResult.status === 403) {
+        return authorizationError({
+          status: 403,
+          message: sagaResult.message,
+          correlationId,
+        });
+      }
+
+      return createPayoutErrorResponse({
+        status: sagaResult.status,
+        code: (sagaResult.code as any) || 'CANCELLATION_REJECTED',
+        userMessage: sagaResult.message,
+        category:
+          sagaResult.status === 404
+            ? 'validation'
+            : sagaResult.status === 403
+              ? 'authorization'
+              : 'provider',
+        retryable: false,
+        correlationId,
+      });
+    }
+
+    const response = NextResponse.json(
+      {
+        success: true,
+        data: sagaResult.data || {
+          reference,
+          status: sagaResult.outcome === 'provider_confirmed' ? 'cancelled' : 'pending',
+          outcome: sagaResult.outcome,
+          message: sagaResult.message,
+        },
       },
-    });
+      { status: sagaResult.status },
+    );
+
+    response.headers.set('X-Correlation-Id', correlationId);
+    return response;
   } catch (error: unknown) {
     console.error('Cancel transfer error:', error);
-    return NextResponse.json(
-      { success: false, message: 'Failed to cancel transfer' },
-      { status: 500 },
-    );
+    return internalError({
+      error,
+      correlationId,
+      message: 'Failed to cancel transfer',
+    });
   }
 }
 
@@ -78,6 +122,8 @@ export async function GET(
   request: NextRequest,
   { params }: { params: Promise<{ reference: string }> },
 ) {
+  const correlationId = extractOrGenerateCorrelationId(request.headers);
+
   try {
     const caller = await resolveCallerIdentity(request);
     if (!caller) {
@@ -96,28 +142,39 @@ export async function GET(
       );
     }
 
-    const existing = getTransferStatus(reference);
+    // IDOR check: authorize caller before returning transfer status.
+    // Denials return uniform 404 to prevent probing and leaking record existence.
+    const auth = authorizeTransferAccess(request, reference);
+    if (!auth.authorized || !auth.record) {
+      return uniformNotFoundResponse();
+    }
 
-    // Non-enumerating error: Return the exact same 404 for unknown AND unauthorized references
-    if (!existing || !isTransferAuthorized(existing, caller)) {
-      return nonEnumeratingNotFoundResponse('Transfer');
+    const transferRecord = auth.record;
+
+    if (cancelledTransfers.has(reference)) {
+      return NextResponse.json({
+        success: true,
+        data: {
+          reference,
+          status: 'cancelled',
+          amount: transferRecord?.amount ?? 0,
+          message: 'Transfer cancellation requested successfully',
+        },
+      });
     }
 
     return NextResponse.json({
       success: true,
-      data: {
-        ...existing,
-        amountMinor:
-          existing.amountMinor !== undefined
-            ? existing.amountMinor.toString()
-            : undefined,
-      },
+      data: transferRecord,
     });
+    response.headers.set('X-Correlation-Id', correlationId);
+    return response;
   } catch (error: unknown) {
     console.error('Get transfer status error:', error);
-    return NextResponse.json(
-      { success: false, message: 'Failed to retrieve transfer status' },
-      { status: 500 },
-    );
+    return internalError({
+      error,
+      correlationId,
+      message: 'Failed to retrieve transfer status',
+    });
   }
 }

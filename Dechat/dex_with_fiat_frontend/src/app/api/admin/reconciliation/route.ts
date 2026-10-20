@@ -2,13 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { ReconciliationRecord } from '@/types';
 import { requireAdminAuth } from '../_utils/requireAdminAuth';
 import { enforceAdminIpAllowlist } from '@/lib/security';
-import {
-  reconciliationStore,
-  reconcileRecords,
-  serializeReconciliationReport,
-  RepairParams,
-} from '@/lib/payout/reconciliation';
-import { fromMinorUnits } from '@/lib/payout/minorUnits';
+import { reconcileStalePayouts } from '@/lib/payout/reconciliation';
 
 export async function GET(request: NextRequest) {
   try {
@@ -138,9 +132,6 @@ export async function GET(request: NextRequest) {
   }
 }
 
-/**
- * Explicit audited action to repair reconciliation records (Issue #39).
- */
 export async function POST(request: NextRequest) {
   try {
     const blockedResponse = enforceAdminIpAllowlist(request);
@@ -151,39 +142,88 @@ export async function POST(request: NextRequest) {
       return authError;
     }
 
-    const body = (await request
-      .json()
-      .catch(() => ({}))) as Partial<RepairParams>;
-    const { action, withdrawalRequestId, reason } = body;
-
-    if (!action || !reason) {
-      return NextResponse.json(
-        {
-          error:
-            'Missing required repair parameters: action and reason are mandatory',
-        },
-        { status: 400 },
-      );
+    let body: Record<string, unknown> = {};
+    try {
+      body = await request.json();
+    } catch {
+      // Body is optional; default to empty object
     }
 
-    const operatorAddress =
-      request.headers.get('x-admin-address') ||
-      request.headers.get('x-admin-token') ||
-      'admin_operator';
+    const staleAgeMs =
+      typeof body.staleAgeMs === 'number' ? body.staleAgeMs : undefined;
+    const batchSize =
+      typeof body.batchSize === 'number' ? body.batchSize : undefined;
 
-    const result = reconciliationStore.repair(
-      body as RepairParams,
-      operatorAddress,
-    );
+    const summary = await reconcileStalePayouts({
+      staleAgeMs,
+      batchSize,
+    });
 
     return NextResponse.json({
       success: true,
-      data: result,
+      data: summary,
     });
-  } catch (error: unknown) {
-    console.error('Error repairing reconciliation record:', error);
-    const message =
-      error instanceof Error ? error.message : 'Failed to repair record';
-    return NextResponse.json({ error: message }, { status: 400 });
+  } catch (error) {
+    console.error('Error running reconciliation:', error);
+    return NextResponse.json(
+      { error: 'Failed to run payout reconciliation' },
+      { status: 500 },
+    );
   }
 }
+
+// Mock data - in production, this would come from a database
+const mockReconciliationData: ReconciliationRecord[] = [
+  {
+    id: '1',
+    depositTxHash: '0x123abc',
+    depositAmount: '100.0',
+    depositUser: 'GA123...',
+    depositDate: '2026-03-20T10:00:00Z',
+    payoutId: 'TRF_123456',
+    payoutAmount: '100.0',
+    payoutRecipient: 'John Doe - 1234567890',
+    payoutStatus: 'completed',
+    payoutDate: '2026-03-20T11:00:00Z',
+    status: 'matched',
+  },
+  {
+    id: '2',
+    depositTxHash: '0x456def',
+    depositAmount: '50.0',
+    depositUser: 'GA456...',
+    depositDate: '2026-03-21T14:30:00Z',
+    payoutId: 'TRF_789012',
+    payoutAmount: '50.0',
+    payoutRecipient: 'Jane Smith - 0987654321',
+    payoutStatus: 'pending',
+    payoutDate: '2026-03-21T15:00:00Z',
+    status: 'matched',
+  },
+  {
+    id: '3',
+    depositTxHash: '0x789ghi',
+    depositAmount: '25.0',
+    depositUser: 'GA789...',
+    depositDate: '2026-03-22T09:15:00Z',
+    payoutId: '',
+    payoutAmount: '',
+    payoutRecipient: '',
+    payoutStatus: 'pending',
+    payoutDate: '',
+    status: 'unmatched',
+  },
+  {
+    id: '4',
+    depositTxHash: '0xabcpqr',
+    depositAmount: '75.0',
+    depositUser: 'GAABC...',
+    depositDate: '2026-03-23T16:45:00Z',
+    payoutId: 'TRF_345678',
+    payoutAmount: '70.0',
+    payoutRecipient: 'Bob Wilson - 1122334455',
+    payoutStatus: 'failed',
+    payoutDate: '2026-03-23T17:00:00Z',
+    status: 'error',
+  },
+];

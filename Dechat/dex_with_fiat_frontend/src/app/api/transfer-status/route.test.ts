@@ -2,6 +2,8 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 vi.mock('server-only', () => ({}));
 import { NextRequest } from 'next/server';
 
+vi.mock('server-only', () => ({}));
+
 const applyRateLimitMock = vi.fn<(...args: unknown[]) => null>(() => null);
 
 vi.mock('@/lib/rateLimit', () => ({
@@ -13,10 +15,25 @@ vi.mock('@/lib/rateLimit', () => ({
 
 vi.mock('@/lib/payout/providers/registry', () => ({
   getPayoutProvider: () => ({
+    name: 'paystack',
     checkTransferStatus: vi
       .fn()
       .mockResolvedValue({ reference: 'ref-123', status: 'success' }),
   }),
+}));
+
+vi.mock('@/lib/auth/authorizationMatrix', () => ({
+  authorizeTransferAccess: vi.fn(() => ({ authorized: true, isAdmin: false })),
+  uniformNotFoundResponse: vi.fn(
+    () =>
+      new Response(
+        JSON.stringify({ success: false, message: 'Transfer not found' }),
+        {
+          status: 404,
+          headers: { 'content-type': 'application/json' },
+        },
+      ),
+  ),
 }));
 
 const { POST } = await import('./route');
