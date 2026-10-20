@@ -161,5 +161,6 @@ function validateEnvExample(): boolean {
 }
 
 // Run validation
-const isValid = validateEnvExample();
-process.exit(isValid ? 0 : 1);
+const envValid = validateEnvExample();
+const alertsValid = validateAlertThresholds();
+process.exit(envValid && alertsValid ? 0 : 1);

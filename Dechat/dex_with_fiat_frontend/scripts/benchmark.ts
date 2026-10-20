@@ -413,7 +413,7 @@ Network: **Testnet**
 | success + denial | ${replayResults.passed} | ${replayResults.failed} |
 
 *Note: Application latencies are derived from \`src/lib/perf.ts\` telemetry during local verification.*
-
+${sloReport}
 ---
 *End of Report*
 `;
