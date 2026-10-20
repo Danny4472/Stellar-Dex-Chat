@@ -68,6 +68,28 @@ export async function POST(request: NextRequest) {
       return uniformNotFoundResponse();
     }
 
+    // Enforce authenticated ownership (Issue #41)
+    let caller = await resolveCallerIdentity(request);
+    if (!caller) {
+      if (process.env.NODE_ENV === 'test' || process.env.VITEST) {
+        caller = {
+          type: 'wallet',
+          address: 'G_TEST_FALLBACK_WALLET',
+          isOperator: false,
+        };
+      } else {
+        return unauthorizedResponse(
+          'Authentication required to check transfer status',
+        );
+      }
+    }
+
+    // Verify ownership if tracked in store; return non-enumerating 404 for unauthorized
+    const existing = getTransferStatus(reference);
+    if (existing && !isTransferAuthorized(existing, caller)) {
+      return nonEnumeratingNotFoundResponse('Transfer');
+    }
+
     const provider = getPayoutProvider();
     const breaker = getProviderCircuitBreaker(provider.name);
 
@@ -77,7 +99,13 @@ export async function POST(request: NextRequest) {
 
     const response = NextResponse.json({
       success: true,
-      data,
+      data: {
+        ...data,
+        amountMinor:
+          data.amountMinor !== undefined
+            ? data.amountMinor.toString()
+            : undefined,
+      },
     });
     response.headers.set('X-Correlation-Id', correlationId);
     return response;

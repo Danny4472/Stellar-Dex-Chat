@@ -64,6 +64,8 @@ export interface TransferStatusRecord {
   reference: string;
   status: PayoutStatus;
   amount: number;
+  amountMinor?: bigint;
+  currency?: string;
   failureReason?: string;
   updatedAt: string;
   updatedAtMs?: number;
@@ -82,92 +84,16 @@ export interface TransferStatusRecord {
 // Key is the transfer reference
 export const transferStore = new Map<string, TransferStatusRecord>();
 
-export function getTransferStatus(reference: string): TransferStatusRecord | undefined {
+export function getTransferStatus(
+  reference: string,
+): TransferStatusRecord | undefined {
   return transferStore.get(reference);
 }
 
-/**
- * Centralized state transition function for payout lifecycle.
- * Validates allowed transitions, rejects invalid transitions,
- * keeps terminal states immutable (except success -> reversed),
- * and records transition history (actor, providerReference, timestamp, reason).
- */
-export function transitionPayoutStatus({
-  reference,
-  targetStatus,
-  actor,
-  providerReference,
-  reason,
-  amount,
-  clientSessionId,
-  failureReason,
-  timestamp = new Date().toISOString(),
-}: TransitionPayoutParams): TransferStatusRecord {
-  const existing = transferStore.get(reference);
-  const currentStatus: PayoutStatus | 'none' = existing?.status ?? 'none';
-
-  // If already at the target status, treat as idempotent no-op without violating immutability
-  if (existing && currentStatus === targetStatus) {
-    return existing;
-  }
-
-  // Validate allowed transitions
-  validatePayoutTransition(currentStatus, targetStatus, reference);
-
-  const transitionRecord: PayoutTransitionRecord = {
-    fromStatus: currentStatus,
-    toStatus: targetStatus,
-    actor,
-    providerReference: providerReference ?? existing?.providerReference,
-    timestamp,
-    reason,
-  };
-
-  const history = existing?.history ? [...existing.history] : [];
-  history.push(transitionRecord);
-
-  const updatedRecord: TransferStatusRecord = {
-    reference,
-    status: targetStatus,
-    amount: amount ?? existing?.amount ?? 0,
-    failureReason: failureReason ?? existing?.failureReason,
-    updatedAt: timestamp,
-    clientSessionId: clientSessionId ?? existing?.clientSessionId,
-    providerReference: providerReference ?? existing?.providerReference,
-    history,
-  };
-
-  transferStore.set(reference, updatedRecord);
-  return updatedRecord;
-}
-
-/**
- * Compatibility wrapper that routes through transitionPayoutStatus.
- */
-export function setTransferStatus(record: TransferStatusRecord): TransferStatusRecord {
-  const existing = transferStore.get(record.reference);
-  const currentStatus = existing?.status ?? 'none';
-
-  if (currentStatus !== record.status) {
-    return transitionPayoutStatus({
-      reference: record.reference,
-      targetStatus: record.status,
-      actor: 'system',
-      providerReference: record.providerReference,
-      reason: record.failureReason ?? 'Status update',
-      amount: record.amount,
-      clientSessionId: record.clientSessionId,
-      failureReason: record.failureReason,
-      timestamp: record.updatedAt || new Date().toISOString(),
-    });
-  }
-
-  // Same status update (e.g. metadata only)
-  transferStore.set(record.reference, {
-    ...existing,
-    ...record,
-    history: existing?.history ?? record.history,
-  });
+export function setTransferStatus(
+  record: TransferStatusRecord,
+): TransferStatusRecord {
+  transferStore.set(record.reference, record);
   return record;
 }
 

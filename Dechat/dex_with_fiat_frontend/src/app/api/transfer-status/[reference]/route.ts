@@ -23,6 +23,11 @@ export async function POST(
   if (limited) return limited;
 
   try {
+    const caller = await resolveCallerIdentity(request);
+    if (!caller) {
+      return unauthorizedResponse('Authentication required to cancel transfer');
+    }
+
     const p = await params;
     const { reference } = p;
 
@@ -55,10 +60,8 @@ export async function POST(
     cancelledTransfers.add(reference);
     transitionPayoutStatus({
       reference,
-      targetStatus: 'cancelled',
-      actor: 'user',
-      reason: 'User requested transfer cancellation',
-      amount: existing?.amount ?? 0,
+      status: 'cancelled',
+      updatedAt: new Date().toISOString(),
       clientSessionId: existing?.clientSessionId,
       failureReason: existing?.failureReason,
       credentialVersion: existing?.credentialVersion,
@@ -122,6 +125,13 @@ export async function GET(
   const correlationId = extractOrGenerateCorrelationId(request.headers);
 
   try {
+    const caller = await resolveCallerIdentity(request);
+    if (!caller) {
+      return unauthorizedResponse(
+        'Authentication required to view transfer status',
+      );
+    }
+
     const p = await params;
     const { reference } = p;
 

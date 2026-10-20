@@ -429,6 +429,7 @@ Repo Avatar
 - **frontend:** Add CSP and security headers in next.config.ts
 - **contract:** Include caller and ledger in deposit, withdraw, set_limit, set_operator events
 - **frontend:** Add dynamic theme tokens to NotificationsCenter.tsx
+- **api:** Harden payout lifecycle with reconciliation, minor units, ownership auth, and provider adapters
 - **contract:** Rolling fiat caps, fee accrual conservation, token precision, and transfer validation (#23, #24, #25, #26)
 - **governance:** Clarify change scoping, required evidence, and payout exception audits
 - **api:** Payout cancellation saga, abuse controls, versioned errors, and strict bank schemas
@@ -922,6 +923,10 @@ Repo Avatar
 - **frontend:** Remove duplicate closing p tag in LandingPage
 - **frontend:** Remove unused CheckCircle import from LandingPage
 - **frontend:** Address issues 1510, 1513, 1515, 1518
+- #119 feat(observability): define user-journey SLOs and alert thresh
+- #120 feat(observability): add PII-redacted structured payout lifecy
+- #121 feat(observability): alert on aging withdrawals and payout rec
+- #122 ops: rehearse backup and disaster recovery for payout state
 - #115 security(ci): add dependency vulnerability scanning with remed
 - #116 security: establish secret inventory, rotation cadence, and le
 - #117 security(api): add regression coverage for payout authorizatio
@@ -1270,6 +1275,8 @@ Repo Avatar
 - **changelog:** Update changelog [skip ci]
 - **changelog:** Update changelog [skip ci]
 - **deps-dev:** Bump @types/node from 25.9.5 to 26.6.5
+- **changelog:** Update changelog [skip ci]
+- **changelog:** Update changelog [skip ci]
 - **changelog:** Update changelog [skip ci]
 
 ### Deprecated

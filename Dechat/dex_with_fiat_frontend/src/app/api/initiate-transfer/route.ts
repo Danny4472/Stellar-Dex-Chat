@@ -118,12 +118,23 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ success: true, data: cached.result });
     }
 
-    const userId =
-      request.headers.get('x-user-id') ||
-      request.headers.get('x-wallet-address') ||
-      clientSessionId ||
-      ip ||
-      'default-user';
+    // Validate payout amounts using integer minor units (Issue #40)
+    const currency =
+      typeof bodyRecord.currency === 'string' ? bodyRecord.currency : 'NGN';
+    const validatedAmount = validatePayoutAmount(amount, currency);
+
+    // Resolve idempotency key: X-Idempotency-Key header, body reference, or generated
+    const headerIdempotencyKey = request.headers.get('X-Idempotency-Key');
+    const idempotencyKey =
+      headerIdempotencyKey ||
+      (typeof bodyRecord.reference === 'string' && bodyRecord.reference
+        ? bodyRecord.reference
+        : `idemp_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`);
+
+    const cached = idempotencyCache.get(idempotencyKey);
+    if (cached && Date.now() - cached.timestamp < IDEMPOTENCY_TTL_MS) {
+      return NextResponse.json({ success: true, data: cached.result });
+    }
 
     telemetry.addLog(span.spanId, 'info', 'Request validated', {
       hasSource: !!source,
