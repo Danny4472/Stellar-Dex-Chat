@@ -429,7 +429,7 @@ Repo Avatar
 - **frontend:** Add CSP and security headers in next.config.ts
 - **contract:** Include caller and ledger in deposit, withdraw, set_limit, set_operator events
 - **frontend:** Add dynamic theme tokens to NotificationsCenter.tsx
-- **api:** Harden payout lifecycle with reconciliation, minor units, ownership auth, and provider adapters
+- Bounded audit views, idempotent payout initiation, lifecycle transitions, and raw webhook verification
 - **contract:** Rolling fiat caps, fee accrual conservation, token precision, and transfer validation (#23, #24, #25, #26)
 - **governance:** Clarify change scoping, required evidence, and payout exception audits
 - **api:** Payout cancellation saga, abuse controls, versioned errors, and strict bank schemas
@@ -450,6 +450,7 @@ Repo Avatar
 - **frontend:** Allow safe inspection during outages and add transaction progress bar stories
 - **integration:** Catch integration failures across intent, signing, and payout
 - **contract:** Event schemas, resource budgets, upgrade compatibility, and adversarial fixtures
+- **api:** Harden payout lifecycle with reconciliation, minor units, ownership auth, and provider adapters
 
 ### Fixed
 
@@ -923,10 +924,6 @@ Repo Avatar
 - **frontend:** Remove duplicate closing p tag in LandingPage
 - **frontend:** Remove unused CheckCircle import from LandingPage
 - **frontend:** Address issues 1510, 1513, 1515, 1518
-- #119 feat(observability): define user-journey SLOs and alert thresh
-- #120 feat(observability): add PII-redacted structured payout lifecy
-- #121 feat(observability): alert on aging withdrawals and payout rec
-- #122 ops: rehearse backup and disaster recovery for payout state
 - #115 security(ci): add dependency vulnerability scanning with remed
 - #116 security: establish secret inventory, rotation cadence, and le
 - #117 security(api): add regression coverage for payout authorizatio
@@ -943,6 +940,10 @@ Repo Avatar
 - #128 test(accessibility): add automated checks to critical frontend
 - #129 ci(contract): detect stale client bindings and incompatible AB
 - #130 devex: provide a reproducible devcontainer for Rust, Stellar,
+- #119 feat(observability): define user-journey SLOs and alert thresh
+- #120 feat(observability): add PII-redacted structured payout lifecy
+- #121 feat(observability): alert on aging withdrawals and payout rec
+- #122 ops: rehearse backup and disaster recovery for payout state
 
 ### Changed
 
@@ -1278,6 +1279,8 @@ Repo Avatar
 - **changelog:** Update changelog [skip ci]
 - **changelog:** Update changelog [skip ci]
 - **changelog:** Update changelog [skip ci]
+- **changelog:** Update changelog [skip ci]
+- **deps:** Bump the actions group across 1 directory with 6 updates
 
 ### Deprecated
 
