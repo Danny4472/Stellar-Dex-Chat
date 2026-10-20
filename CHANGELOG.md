@@ -922,6 +922,10 @@ Repo Avatar
 - **frontend:** Remove duplicate closing p tag in LandingPage
 - **frontend:** Remove unused CheckCircle import from LandingPage
 - **frontend:** Address issues 1510, 1513, 1515, 1518
+- #119 feat(observability): define user-journey SLOs and alert thresh
+- #120 feat(observability): add PII-redacted structured payout lifecy
+- #121 feat(observability): alert on aging withdrawals and payout rec
+- #122 ops: rehearse backup and disaster recovery for payout state
 - #115 security(ci): add dependency vulnerability scanning with remed
 - #116 security: establish secret inventory, rotation cadence, and le
 - #117 security(api): add regression coverage for payout authorizatio
@@ -1270,6 +1274,7 @@ Repo Avatar
 - **changelog:** Update changelog [skip ci]
 - **changelog:** Update changelog [skip ci]
 - **deps-dev:** Bump @types/node from 25.9.5 to 26.6.5
+- **changelog:** Update changelog [skip ci]
 - **changelog:** Update changelog [skip ci]
 
 ### Deprecated
