@@ -54,6 +54,8 @@ export interface TransferStatusRecord {
   reference: string;
   status: 'pending' | 'success' | 'failed' | 'reversed' | 'cancelled';
   amount: number;
+  amountMinor?: bigint;
+  currency?: string;
   failureReason?: string;
   updatedAt: string;
   updatedAtMs?: number;
@@ -72,11 +74,15 @@ export interface TransferStatusRecord {
 // Key is the transfer reference
 export const transferStore = new Map<string, TransferStatusRecord>();
 
-export function getTransferStatus(reference: string) {
+export function getTransferStatus(
+  reference: string,
+): TransferStatusRecord | undefined {
   return transferStore.get(reference);
 }
 
-export function setTransferStatus(record: TransferStatusRecord) {
+export function setTransferStatus(
+  record: TransferStatusRecord,
+): TransferStatusRecord {
   transferStore.set(record.reference, record);
   return record;
 }

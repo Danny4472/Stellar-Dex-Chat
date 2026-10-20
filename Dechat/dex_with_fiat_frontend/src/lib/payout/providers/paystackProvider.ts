@@ -6,14 +6,16 @@ import type {
   CancelTransferInput,
   CancelTransferResult,
   CreateRecipientInput,
-  CreateRecipientResult,
+  InitiatedTransfer,
   InitiateTransferInput,
-  InitiateTransferResult,
+  NormalizedPayoutStatus,
+  PayoutErrorCode,
   PayoutProvider,
+  PayoutProviderError,
+  TransferStatus,
   TransferStatusInput,
-  TransferStatusResult,
+  VerifiedAccount,
   VerifyAccountInput,
-  VerifyAccountResult,
 } from './types';
 
 export function toKobo(amountNgn: number): number {
@@ -27,8 +29,27 @@ function paystackHeaders(secretKey?: string) {
   };
 }
 
-export const paystackProvider: PayoutProvider = {
-  name: 'paystack',
+function normalizePaystackStatus(status?: string): NormalizedPayoutStatus {
+  if (!status) return 'pending';
+  const lower = status.toLowerCase();
+  switch (lower) {
+    case 'success':
+      return 'success';
+    case 'failed':
+    case 'rejected':
+      return 'failed';
+    case 'reversed':
+      return 'reversed';
+    case 'cancelled':
+      return 'cancelled';
+    case 'pending':
+    case 'processing':
+    case 'queued':
+    case 'otp':
+    default:
+      return 'pending';
+  }
+}
 
   async verifyAccount(input: VerifyAccountInput): Promise<VerifyAccountResult> {
     const { accountNumber, bankCode } = input;
@@ -37,15 +58,30 @@ export const paystackProvider: PayoutProvider = {
     if (!cred || !cred.secretKey) {
       console.warn('Paystack secret key not found, using mock verification');
 
-      const mockVerification: VerifyAccountResult = {
-        account_number: accountNumber,
-        account_name: 'John Doe',
-        bank_id: Number.parseInt(bankCode, 10),
-      };
+    return new PayoutProviderError({
+      message,
+      code,
+      statusCode: status,
+      retryable,
+      providerCode,
+      rawResponse: error.response?.data,
+    });
+  }
+
+  const message =
+    error instanceof Error ? error.message : 'Unknown provider error';
+  return new PayoutProviderError({
+    message,
+    code: 'UNKNOWN_ERROR',
+    retryable: false,
+  });
+}
 
       await new Promise((resolve) => setTimeout(resolve, 500));
       return mockVerification;
     }
+  }
+}
 
     return await executeWithTimeoutBudget(
       'verify',
@@ -85,26 +121,15 @@ export const paystackProvider: PayoutProvider = {
       console.warn(
         'Paystack secret key not found, using mock recipient creation',
       );
-
-      const mockRecipient = {
-        active: true,
-        createdAt: new Date().toISOString(),
-        currency: input.currency,
-        domain: 'test',
-        id: Math.floor(Math.random() * 1000000),
-        integration: 123456,
+      return {
+        recipientCode: `RCP_${Math.random().toString(36).substring(2, 11)}`,
         name: input.name,
-        recipient_code: `RCP_${Math.random().toString(36).substr(2, 9)}`,
+        accountNumber: input.account_number,
+        bankCode: input.bank_code,
+        currency,
         type: input.type,
-        updatedAt: new Date().toISOString(),
-        is_deleted: false,
-        details: {
-          authorization_code: null,
-          account_number: input.account_number,
-          account_name: input.name,
-          bank_code: input.bank_code,
-          bank_name: 'Mock Bank',
-        },
+        provider: 'paystack',
+        rawResponse: { mock: true },
       };
 
       await new Promise((resolve) => setTimeout(resolve, 500));
@@ -144,17 +169,24 @@ export const paystackProvider: PayoutProvider = {
       console.warn(
         'Paystack secret key not found, using mock transfer initiation',
       );
+      const mockResult: InitiatedTransfer = {
+        reference,
+        status: 'pending',
+        providerReference: `PROV_${reference}`,
+        transferCode: `TRF_${Math.random().toString(36).substring(2, 9)}`,
+        amountMinor,
+        currency,
+        recipientCode: input.recipient,
+        rawResponse: { mock: true },
+      };
+      adapterIdempotencyCache.set(reference, mockResult);
+      return mockResult;
+    }
 
-      const mockTransfer = {
-        reference:
-          input.reference ||
-          `tx_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
-        integration: 123456,
-        domain: 'test',
-        amount: input.amount,
-        currency: 'NGN',
+    return executeWithRetry(async () => {
+      const transferData = {
         source: input.source,
-        reason: input.reason || 'Crypto withdrawal',
+        amount: Number(amountMinor), // Paystack requires amount in kobo/minor units as number
         recipient: input.recipient,
         status: 'pending',
         transfer_code: `TRF_${Math.random().toString(36).substr(2, 9)}`,
