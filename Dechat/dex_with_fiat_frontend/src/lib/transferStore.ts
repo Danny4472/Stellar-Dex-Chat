@@ -1,3 +1,17 @@
+import {
+  PayoutStatus,
+  PayoutActor,
+  PayoutTransitionRecord,
+  validatePayoutTransition,
+} from './payout/payoutLifecycle';
+
+export {
+  type PayoutStatus,
+  type PayoutActor,
+  type PayoutTransitionRecord,
+  InvalidPayoutTransitionError,
+} from './payout/payoutLifecycle';
+
 type ReplayCacheEntry = {
   seenAt: number;
 };
@@ -42,17 +56,13 @@ export function replayCacheStats() {
     maxSize: DEFAULT_REPLAY_MAX_SIZE,
   };
 }
-/**
- * Simple in-memory store for transfer status tracking.
- *
- * LIMITATION: This store is intentionally simple and resets on server restart
- * as there is no persistent database connected for this stage.
- * This is suitable for real-time status polling during a user session.
- */
 
+/**
+ * In-memory store for transfer status and payout lifecycle tracking.
+ */
 export interface TransferStatusRecord {
   reference: string;
-  status: 'pending' | 'success' | 'failed' | 'reversed' | 'cancelled';
+  status: PayoutStatus;
   amount: number;
   amountMinor?: bigint;
   currency?: string;

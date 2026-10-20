@@ -33,6 +33,7 @@ vi.mock('@/lib/rateLimit', () => ({
   getClientIp: vi.fn(() => '127.0.0.1'),
 }));
 
+const mockTransitionPayoutStatus = vi.fn();
 vi.mock('@/lib/transferStore', () => ({
   setTransferStatus: vi.fn(),
   getTransferStatus: vi.fn(() => undefined),
@@ -68,7 +69,7 @@ function makeRequest(body: unknown, headers: Record<string, string> = {}) {
   );
 }
 
-describe('POST /api/initiate-transfer', () => {
+describe('POST /api/initiate-transfer (Issue #32)', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     payoutRetryQueue._resetForTest();

@@ -1,9 +1,11 @@
 import { NextRequest, NextResponse } from 'next/server';
-import crypto from 'crypto';
 import { telemetry } from '@/lib/telemetry';
-import { isReplayEvent } from '@/lib/transferStore';
-import { getTransferStatus, setTransferStatus } from '@/lib/transferStore';
-import { serverEnv as env } from '@/lib/serverEnv';
+import {
+  isReplayEvent,
+  getTransferStatus,
+  transitionPayoutStatus,
+  InvalidPayoutTransitionError,
+} from '@/lib/transferStore';
 import { publishPaymentStatus } from '@/lib/paymentStatusEvents';
 import { webhookDeduplicationService } from '@/lib/payout/webhookDeduplication';
 import { payoutReconciliationService } from '@/lib/payout/reconciliation';
@@ -60,6 +62,9 @@ export async function POST(request: NextRequest) {
 
     const payload = await request.text();
     const signature = request.headers.get('x-paystack-signature');
+    const timestamp =
+      request.headers.get('x-paystack-signature-timestamp') ||
+      request.headers.get('x-webhook-timestamp');
 
     telemetry.addLog(span.spanId, 'info', 'Webhook request parsed', {
       hasSignature: !!signature,
@@ -124,13 +129,14 @@ export async function POST(request: NextRequest) {
       });
       telemetry.finishSpan(span.spanId, {
         success: false,
-        error: 'Invalid signature',
+        error: verification.message ?? 'Invalid signature',
       });
 
-      console.error('Invalid webhook signature');
+      console.error('Webhook signature verification failed:', verification.message);
+      const status = verification.error === 'missing_secret' ? 400 : 401;
       return NextResponse.json(
-        { message: 'Invalid signature' },
-        { status: 401 },
+        { message: verification.message ?? 'Invalid signature' },
+        { status },
       );
     }
     // Signature verified: request is recognized as a trusted provider callback and excluded from rate limiting
@@ -140,6 +146,11 @@ export async function POST(request: NextRequest) {
       ...credentialManager.logContext(matchedVersion),
     });
 
+    telemetry.addLog(span.spanId, 'info', 'Webhook signature verified', {
+      endpoint: '/api/webhook',
+    });
+
+    // Step 2: Parse payload into domain state only AFTER signature verification has passed
     let event: PaystackWebhookEvent;
     try {
       event = JSON.parse(payload) as PaystackWebhookEvent;

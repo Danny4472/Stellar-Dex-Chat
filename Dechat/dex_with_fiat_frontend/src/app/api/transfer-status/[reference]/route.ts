@@ -58,7 +58,7 @@ export async function POST(
     }
 
     cancelledTransfers.add(reference);
-    setTransferStatus({
+    transitionPayoutStatus({
       reference,
       status: 'cancelled',
       updatedAt: new Date().toISOString(),
