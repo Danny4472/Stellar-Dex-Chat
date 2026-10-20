@@ -1,103 +1,64 @@
 # Contributing
 
-## Branch Naming
+Thanks for contributing to Dechat. This document covers the workflow for
+changes that touch the Soroban smart contract interface and its generated
+TypeScript client bindings.
 
-Branches follow this pattern:
-<your-username>/<type>/<short-description>
+## Contract bindings and ABI compatibility
 
-`<type>` is one of:
+The TypeScript bindings under `Dechat/dex_with_fiat_frontend/src/contracts/`
+are generated from the Soroban contract spec using the pinned toolchain
+recorded in the repository. They are committed artifacts and must stay in
+sync with the contract source.
 
-- `feat/` — new feature
-- `fix/` — bug fix
-- `chore/` — maintenance, tooling, dependencies
-- `docs/` — documentation only
-- `refactor/` — code change that isn't a fix or a feature
-- `test/` — adding or fixing tests
+### Regenerating bindings
 
-If your branch addresses one or more issues, include the issue number(s) in the description:
-feat/issues-986-987-988-frontend-accessibility
+After any change to the contract interface, regenerate the bindings with the
+pinned toolchain and commit the result together with the contract change:
 
-fix/issue-966-fee-calculation-overflow
+```sh
+# from the repository root, using the pinned toolchain
+make bindings        # or the documented generation command for this repo
+```
 
-## Commit Message Format
+Generation is deterministic: running it on an unchanged contract must leave
+unrelated files untouched. If regeneration produces diffs outside the
+bindings directory, treat that as a bug and fix the generator rather than
+committing the noise.
 
-Commits follow [Conventional Commits](https://www.conventionalcommits.org/):
-<type>(<scope>): <description>
+### CI drift check
 
-`<type>` must be one of:
+CI builds the contract spec from the pinned toolchain and compares it against
+the committed bindings. The check fails when any of the following drift
+without regenerated bindings:
 
-- `feat` — new feature
-- `fix` — bug fix
-- `docs` — documentation only
-- `style` — formatting, no code meaning change
-- `refactor` — code change that isn't a fix or a feature
-- `perf` — performance improvement
-- `test` — adding or fixing tests
-- `build` — build system or dependencies
-- `ci` — CI configuration
-- `chore` — anything else maintenance-related
-- `security` — security fix
+- function signatures (added, removed, or renamed functions)
+- argument names, types, or ordering
+- return types
+- error codes and their variants
 
-`<scope>` is optional and usually the area touched, e.g. `frontend`, `contract`.
+When the check fails, CI emits a reviewable ABI diff artifact so reviewers can
+see the exact mismatch. To resolve it, regenerate the bindings and commit them
+in the same change as the contract edit.
 
-Reference issue numbers in the description when relevant:
-feat(frontend): add CSV export button to AuditTable
+### Breaking-change versioning
 
-fix(contract): integer overflow in fee calculation for large deposits #966
+Classify interface changes before merging:
 
-docs: add CONTRIBUTING.md with branch and commit conventions
+- **Non-breaking** — additive changes such as new functions, new optional
+  arguments, or new error variants. These may ship in a minor release.
+- **Breaking** — removed or renamed functions, changed argument or return
+  types, reordered arguments, or removed/renumbered error codes. These require
+  a major version bump of the contract interface and a migration note in the
+  changelog.
 
-A breaking change is marked with `!` after the type/scope:
-feat(contract)!: change withdrawal function signature
+Breaking changes must be called out explicitly in the pull request description,
+including the old and new signatures, so reviewers can confirm the versioning
+policy was applied.
 
-## Pull Request Checklist
+## Pull request checklist
 
-Before opening a PR:
-
-- [ ] Branch name follows the format above
-- [ ] Commit messages follow the format above
-- [ ] PR description links the issue(s) it closes (`Closes #123`)
-- [ ] `npx lint-staged` runs clean (this also runs automatically on commit)
-- [ ] Tests pass locally
-- [ ] No unrelated files included in the diff
-
-## Backup & Disaster Recovery for Payout State
-
-Changes that touch payout intents, idempotency records, or audit history must keep the
-backup/DR guarantees below intact. See the payout DR runbook for the full procedure.
-
-### Recovery objectives
-
-| Data set | RPO | RTO |
-| --- | --- | --- |
-| Payout intents (in-flight and settled) | 5 minutes | 1 hour |
-| Idempotency records | 0 (synchronous, replicated) | 1 hour |
-| Audit history | 5 minutes | 4 hours |
-
-Idempotency records must never be lost: a restore that drops them risks replaying transfers.
-
-### Backup ownership, retention, and access
-
-- Backups are encrypted at rest and in transit; keys are held by the on-call platform owner
-  and rotated on the standard key-rotation schedule.
-- Retention: 35 days of point-in-time recovery plus monthly full snapshots for 12 months.
-- Restore permissions are limited to the on-call platform owner and a designated backup
-  approver; restores require a second reviewer.
-- Dependencies: managed database snapshots, the key management service, and the audit log
-  archive. A restore is not complete until all three are verified.
-
-### Reconciliation before writes resume
-
-After restoring into isolation, reconcile before re-enabling writes:
-
-1. Compare restored payout intents against authoritative provider records and on-chain state.
-2. Verify audit history is continuous with no gaps across the restore boundary.
-3. Confirm idempotency records are present so no transfer can be replayed.
-4. Reconcile in-flight transfers and resolve any mismatch before writes resume.
-
-### Drills and remediation
-
-- Run a restore drill quarterly, and after any change to the backup pipeline.
-- Each drill restores into isolation and verifies counts, audit continuity, idempotency, and
-  in-flight transfer reconciliation.
-- File remediation items as issues, assign an owner, and track them to closure before the next drill.
+- [ ] Contract interface changes include regenerated bindings.
+- [ ] The CI drift check passes with no ABI diff.
+- [ ] Breaking changes are documented and versioned as described above.
+- [ ] Regeneration left unrelated files unchanged.
